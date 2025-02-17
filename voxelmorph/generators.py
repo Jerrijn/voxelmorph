@@ -448,3 +448,65 @@ def synthmorph(label_maps, batch_size=1, same_subj=False, flip=False):
             x = np.flip(x, axis=axes + 1)
 
         yield (x[:batch_size], x[batch_size:]), np.zeros(0)
+
+
+import numpy as np
+import voxelmorph as vxm
+
+def my_custom_preprocessing(vol, target_shape, multichannel=False):
+    """
+    Example custom preprocessing:
+      - Ensure the volume is normalized.
+      - Convert RGB to grayscale if necessary.
+      - Resize or crop the volume to target_shape.
+    """
+    # Convert RGB to grayscale if needed.
+    if not multichannel and vol.shape[-1] == 3:
+        vol = np.mean(vol, axis=-1, keepdims=True)
+    
+    # Normalize intensities to [0,1] (example; adjust as needed)
+    vol = (vol - np.min(vol)) / (np.max(vol) - np.min(vol) + 1e-12)
+    
+    # Resize or crop/pad to target_shape.
+    # (This is a placeholder—implement your preferred method.)
+    current_shape = vol.shape[0:3]  # assume spatial dims are the first three dimensions
+    if current_shape != target_shape:
+        vol = vxm.py.utils.resize_vol(vol, target_shape)
+    
+    return vol
+
+def custom_scan_to_scan(file_list, batch_size=1, target_shape=(160,160,64), multichannel=False):
+    """
+    A custom generator that:
+      1. Reads each file from the list.
+      2. Loads the volume.
+      3. Applies custom preprocessing.
+      4. Yields a batch of preprocessed volumes for scan-to-scan registration.
+    """
+    while True:
+        moving_batch = []
+        fixed_batch = []
+        for i in range(batch_size):
+            # For scan-to-scan registration, you might randomly sample two different files.
+            file1 = np.random.choice(file_list)
+            file2 = np.random.choice(file_list)
+            # Load volumes (without adding a batch or feature axis yet)
+            vol1 = vxm.py.utils.load_volfile(file1, add_batch_axis=False, add_feat_axis=False)
+            vol2 = vxm.py.utils.load_volfile(file2, add_batch_axis=False, add_feat_axis=False)
+            
+            # Apply your custom preprocessing.
+            vol1 = my_custom_preprocessing(vol1, target_shape, multichannel)
+            vol2 = my_custom_preprocessing(vol2, target_shape, multichannel)
+            
+            # Add a channel axis if needed.
+            if not multichannel:
+                vol1 = np.expand_dims(vol1, -1)
+                vol2 = np.expand_dims(vol2, -1)
+            
+            moving_batch.append(vol1)
+            fixed_batch.append(vol2)
+        
+        # Stack batches along a new axis and add batch dimension.
+        moving_batch = np.stack(moving_batch, axis=0)
+        fixed_batch = np.stack(fixed_batch, axis=0)
+        yield (moving_batch, fixed_batch)

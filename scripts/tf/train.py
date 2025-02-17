@@ -32,6 +32,30 @@ Unless required by applicable law or agreed to in writing, software distributed 
 distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
 implied. See the License for the specific language governing permissions and limitations under the
 License.
+
+Usage:
+------
+To train a VoxelMorph model, run this script with the required arguments:
+
+    python train_voxelmorph.py --img-list <path_to_training_list> --model-dir <output_model_directory>
+
+Optional arguments:
+    --atlas <path_to_atlas>        # If specified, performs scan-to-atlas registration
+    --batch-size <int>             # Set batch size (default: 1)
+    --epochs <int>                 # Number of training epochs (default: 1500)
+    --steps-per-epoch <int>        # Steps per epoch (default: 100)
+    --lr <float>                   # Learning rate (default: 1e-4)
+    --image-loss <mse/ncc>         # Image similarity loss function (default: mse)
+    --lambda <float>               # Regularization weight for deformation loss (default: 0.01)
+    --kl-lambda <float>            # KL loss regularization weight (default: 10)
+    --bidir                        # Enables bidirectional loss computation
+    --use-probs                    # Enables probabilistic model
+    --load-weights <path>          # Load pre-trained weights for fine-tuning
+    --gpu <device_id>              # Specify GPU ID for training (default: 0)
+
+Example:
+--------
+    python train_voxelmorph.py --img-list data/train_list.txt --model-dir models --epochs 1000 --lr 1e-4
 """
 
 import os
@@ -40,11 +64,11 @@ import argparse
 import numpy as np
 import tensorflow as tf
 import voxelmorph as vxm
-
+import nibabel as nib
 
 # disable eager execution
-tf.compat.v1.disable_eager_execution()
-tf.compat.v1.experimental.output_all_intermediates(True) # https://github.com/tensorflow/tensorflow/issues/54458
+# tf.compat.v1.disable_eager_execution()
+# tf.compat.v1.experimental.output_all_intermediates(True) # https://github.com/tensorflow/tensorflow/issues/54458
 
 # parse the commandline
 parser = argparse.ArgumentParser()
@@ -115,6 +139,40 @@ else:
     generator = vxm.generators.scan_to_scan(
         train_files, batch_size=args.batch_size, bidir=args.bidir, add_feat_axis=add_feat_axis)
 
+
+def ensure_single_channel(image):
+    """Ensure images have 1 channel by converting 3-channel to grayscale."""
+    if image.shape[-1] == 3:  # If RGB, convert to grayscale
+        return np.mean(image, axis=-1, keepdims=True)
+    return image  # Already correct shape
+
+def fixed_generator(original_generator):
+    for moving, fixed in original_generator:
+        # Process each moving image individually.
+        moving = np.stack([ensure_single_channel(np.array(m, dtype=np.float32)) for m in moving], axis=0)
+        # Process each fixed image individually.
+        fixed = np.stack([ensure_single_channel(np.array(f, dtype=np.float32)) for f in fixed], axis=0)
+        # Yield a list of two tensors so that the model receives both inputs as one argument.
+        yield ([moving, fixed])
+
+
+generator = fixed_generator(generator)
+# for moving, fixed in generator:
+#     print("Moving shapes:", [m.shape for m in moving])
+#     print("Fixed shapes:", [f.shape for f in fixed])
+#     break
+
+# for i, file_path in enumerate(train_files):  # Check first 5 images
+#     img = nib.load(file_path).get_fdata()
+#     print(f"Image {i} Shape:", img.shape, "File Path:", file_path)        
+# for moving, fixed in generator:
+#     print(fixed)
+#     for i, f in enumerate(fixed):
+#         print(f"Fixed[{i}] Original Shape:", np.array(f).shape)
+#       # Only print one batch
+#     for i, f in enumerate(moving):
+#         print(f"moving[{i}] Original Shape:", np.array(f).shape)
+#     break  # Only print one batch
 # extract shape and number of features from sampled input
 sample_shape = next(generator)[0][0].shape
 inshape = sample_shape[1:-1]
@@ -188,12 +246,61 @@ else:
 model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=args.lr), loss=losses, loss_weights=weights)
 
 # save starting weights
-model.save(save_filename.format(epoch=args.initial_epoch))
+model.save_weights('my_model_weights.weights.h5')
 
-model.fit(generator,
-         initial_epoch=args.initial_epoch,
-         epochs=args.epochs,
-         steps_per_epoch=args.steps_per_epoch,
-         callbacks=[save_callback],
-         verbose=1
-         )
+
+
+# Define the expected output structure of the generator
+output_signature = (
+    (tf.TensorSpec(shape=(None, *inshape, nfeats), dtype=tf.float32),
+     tf.TensorSpec(shape=(None, *inshape, nfeats), dtype=tf.float32)),
+    (tf.TensorSpec(shape=(None, *inshape, nfeats), dtype=tf.float32),
+     tf.TensorSpec(shape=(None, *inshape, nfeats), dtype=tf.float32))
+)
+
+
+import numpy as np
+
+# def fixed_generator():
+#     for moving, fixed in generator:
+#     #     print("\nChecking batch consistency...")
+
+#         # Convert to NumPy arrays and print shapes
+#         moving = [np.array(m, dtype=np.float32) for m in moving]
+#         fixed = [np.array(f, dtype=np.float32) for f in fixed]
+
+#         # for i, f in enumerate(fixed):
+#         #     print(f"Fixed[{i}] Shape:", f.shape)
+
+#         # for i, m in enumerate(moving):
+#         #     print(f"Moving[{i}] Shape:", m.shape)
+
+#         # Ensure all have the same shape before stacking
+#         try:
+#             moving = np.stack(moving, axis=0)
+#             fixed = np.stack(fixed, axis=0)
+#         except ValueError:
+#             # print("Error: Inconsistent shapes in batch!")
+#             continue  # Skip bad batch
+
+#         yield (moving, fixed)
+
+import numpy as np
+import voxelmorph as vxm
+
+
+dataset = tf.data.Dataset.from_generator(
+    lambda: generator,
+    output_signature=output_signature
+)
+
+
+
+
+# Use dataset in model.fit()
+model.fit(dataset,
+          initial_epoch=args.initial_epoch,
+          epochs=args.epochs,
+          steps_per_epoch=args.steps_per_epoch,
+          callbacks=[save_callback],
+          verbose=1)

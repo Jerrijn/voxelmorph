@@ -1,70 +1,75 @@
-#!/usr/bin/env python
-
-"""
-Postprocess script for restoring original image dimensions.
-- Unpads images back to their original shape.
-- Saves the final output.
-
-Usage:
-    python postprocess.py --input_dir path/to/preprocessed_data --output_dir path/to/final_output
-"""
-
 import os
-import argparse
 import numpy as np
 import nibabel as nib
-from glob import glob
+import argparse
+import traceback
 
+"""
+Restore Preprocessed Medical Images
 
-def unpad_volume(vol, original_shape):
-    """Restores a volume to its original shape after padding."""
-    current_shape = np.array(vol.shape)
-    pad_total = current_shape - original_shape
-    pad_before = pad_total // 2
+This script restores a preprocessed NIfTI (.nii) medical image back to its original shape using metadata stored in a .npy file.
 
-    slices = []
-    for pb, orig in zip(pad_before, original_shape):
-        slices.append(slice(pb, pb + orig))
+Usage:
+    python restore_image.py --file path/to/image_preprocessed.nii --output_dir path/to/output_folder
 
-    return vol[tuple(slices)]
+The restored image will be saved in the specified output folder.
+"""
 
+def crop_to_original_shape(vol, original_shape):
+    """Crops the volume back to its original shape."""
+    current_shape = vol.shape
+    crop_slices = []
+    for i in range(3):
+        start = (current_shape[i] - original_shape[i]) // 2
+        end = start + original_shape[i]
+        crop_slices.append(slice(start, end))
+    return vol[crop_slices[0], crop_slices[1], crop_slices[2]]
 
-def postprocess_image(file_path, output_dir):
-    """Restores original dimensions using metadata and saves the final image."""
-    img = nib.load(file_path)
-    vol = img.get_fdata()
+def restore_image(preprocessed_file, output_dir):
+    """Restores a preprocessed image to its original shape using metadata and saves it in the output directory."""
+    try:
+        # Ensure metadata file exists
+        metadata_file = preprocessed_file.replace('.nii', '.nii.npy')
+        if not os.path.exists(metadata_file):
+            raise FileNotFoundError(f"Metadata file not found: {metadata_file}")
 
-    # Load metadata
-    metadata_file = file_path.replace('_preprocessed.nii.gz', '_metadata.npy')
-    if not os.path.exists(metadata_file):
-        print(f"Skipping {file_path} (metadata not found)")
-        return
+        # Load preprocessed image
+        img = nib.load(preprocessed_file)
+        vol = img.get_fdata()
 
-    metadata = np.load(metadata_file, allow_pickle=True).item()
-    original_shape = metadata['original_shape']
-    affine = metadata['affine']
+        # Load metadata
+        metadata = np.load(metadata_file, allow_pickle=True).item()
+        original_shape = metadata.get("original_shape")
+        affine = metadata.get("affine")
+        
+        if original_shape is None or affine is None:
+            raise ValueError("Metadata file is missing required information.")
 
-    # Unpad to restore original dimensions
-    vol_restored = unpad_volume(vol, original_shape)
+        # Crop back to original shape
+        restored_vol = crop_to_original_shape(vol, original_shape)
 
-    # Save final image
-    final_file = os.path.join(output_dir, os.path.basename(file_path).replace('_preprocessed', '_final'))
-    nib.save(nib.Nifti1Image(vol_restored, affine), final_file)
+        # Ensure output directory exists
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save restored image in the output directory
+        restored_filename = os.path.basename(preprocessed_file).replace('_preprocessed.nii', '_restored.nii')
+        restored_file = os.path.join(output_dir, restored_filename)
+        nib.save(nib.Nifti1Image(restored_vol, affine), restored_file)
 
-    print(f"Restored: {file_path} -> {final_file}")
+        print(f"✅ Restored: {preprocessed_file} -> {restored_file}")
+    
+    except Exception as e:
+        print(f"❌ Error restoring {preprocessed_file}: {e}")
+        traceback.print_exc()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Postprocess medical images to restore original dimensions.")
-    parser.add_argument('--input_dir', required=True, help='Directory containing preprocessed images')
-    parser.add_argument('--output_dir', required=True, help='Directory to save final restored images')
+    parser = argparse.ArgumentParser(description="Restore a preprocessed medical image to its original shape.")
+    parser.add_argument('--file', required=True, help='Path to the preprocessed .nii file')
+    parser.add_argument('--output_dir', required=True, help='Directory to save the restored image')
     args = parser.parse_args()
-
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    files = glob(os.path.join(args.input_dir, '*_preprocessed.nii.gz'))
-    for file in files:
-        postprocess_image(file, args.output_dir)
+    
+    restore_image(args.file, args.output_dir)
 
 
 if __name__ == "__main__":

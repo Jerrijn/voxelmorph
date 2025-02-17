@@ -63,13 +63,15 @@ def preprocess_image(file_path, output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess medical images for training.")
-    parser.add_argument('--input_dir', required=True, help='Directory containing raw images (.nii.gz)')
+    parser.add_argument('--input_dir', required=True, help='Directory containing raw images (.nii)')
     parser.add_argument('--output_dir', required=True, help='Directory to save preprocessed images')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    files = glob(os.path.join(args.input_dir, '*.nii.gz'))
+    files = glob(os.path.join(args.input_dir, '*.nii'))
+    print(f"Found {len(files)} files in {args.input_dir}: {files}")  # Add this for debugging
+
     for file in files:
         preprocess_image(file, args.output_dir)
 
