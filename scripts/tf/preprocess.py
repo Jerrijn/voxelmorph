@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 """
 Preprocess script for medical images.
 - Normalizes intensity values.
@@ -16,31 +15,52 @@ import argparse
 import numpy as np
 import voxelmorph as vxm
 import nibabel as nib
-from glob import glob
 
 
 def pad_or_crop_volume(vol, factor=16):
-    """Pads or crops a 3D volume to ensure dimensions are multiples of `factor`."""
+    """
+    Pads or crops a 3D volume so that each spatial dimension becomes a multiple of `factor`.
+    
+    Parameters:
+        vol (np.ndarray): 3D volume.
+        factor (int): The factor to which dimensions must be a multiple.
+    
+    Returns:
+        vol_padded (np.ndarray): The padded/cropped volume.
+        original_shape (tuple): The original volume shape.
+    """
     original_shape = np.array(vol.shape)
     target_shape = np.ceil(original_shape / factor).astype(int) * factor
     pad_crop = target_shape - original_shape
-    pad_before = pad_crop // 2
-    pad_after = pad_crop - pad_before
 
-    slices = []
+    # If cropping is needed (i.e., pad_crop[d] is negative), perform cropping first.
+    cropped = vol
     for d in range(3):
-        if pad_crop[d] >= 0:
-            slices.append((pad_before[d], pad_after[d]))  # Padding
-        else:
-            slices.append((slice(-pad_before[d], target_shape[d] + pad_after[d]),))  # Cropping
-
-    # Apply padding
-    vol_padded = np.pad(vol, slices, mode='constant', constant_values=0)
+        if pad_crop[d] < 0:
+            start = (-pad_crop[d]) // 2
+            end = start + target_shape[d]
+            slices = [slice(None)] * 3
+            slices[d] = slice(start, end)
+            cropped = cropped[tuple(slices)]
+    
+    new_shape = np.array(cropped.shape)
+    pad_needed = target_shape - new_shape
+    pad_before = pad_needed // 2
+    pad_after = pad_needed - pad_before
+    pad_width = [(int(pad_before[i]), int(pad_after[i])) for i in range(3)]
+    vol_padded = np.pad(cropped, pad_width, mode='constant', constant_values=0)
+    
     return vol_padded, original_shape
 
 
 def preprocess_image(file_path, output_dir):
-    """Loads, normalizes, and preprocesses an image."""
+    """
+    Loads, normalizes, and preprocesses an image, then saves the result and metadata.
+    
+    Parameters:
+        file_path (str): Path to the input NIfTI image.
+        output_dir (str): Output folder where the preprocessed image will be saved.
+    """
     img = nib.load(file_path)
     vol = img.get_fdata()
     
@@ -50,8 +70,18 @@ def preprocess_image(file_path, output_dir):
     # Pad/crop to multiples of 16
     vol_padded, original_shape = pad_or_crop_volume(vol, factor=16)
 
-    # Save preprocessed image
-    preprocessed_file = os.path.join(output_dir, os.path.basename(file_path).replace('.nii.gz', '_preprocessed.nii.gz'))
+    # Determine the output file name based on the input file name.
+    basename = os.path.basename(file_path)
+    if basename.endswith('.nii.gz'):
+        out_name = basename.replace('.nii.gz', '_preprocessed.nii.gz')
+    elif basename.endswith('.nii'):
+        out_name = basename.replace('.nii', '_preprocessed.nii.gz')
+    else:
+        out_name = basename + '_preprocessed.nii.gz'
+
+    # Ensure the output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+    preprocessed_file = os.path.join(output_dir, out_name)
     nib.save(nib.Nifti1Image(vol_padded, img.affine), preprocessed_file)
 
     # Save metadata for undoing preprocessing
@@ -63,17 +93,20 @@ def preprocess_image(file_path, output_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Preprocess medical images for training.")
-    parser.add_argument('--input_dir', required=True, help='Directory containing raw images (.nii)')
-    parser.add_argument('--output_dir', required=True, help='Directory to save preprocessed images')
+    parser.add_argument('--input_dir', required=True, help='Directory containing raw images (.nii or .nii.gz)')
+    parser.add_argument('--output_dir', required=True, help='Directory to save preprocessed images, preserving folder structure')
     args = parser.parse_args()
 
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    files = glob(os.path.join(args.input_dir, '*.nii'))
-    print(f"Found {len(files)} files in {args.input_dir}: {files}")  # Add this for debugging
-
-    for file in files:
-        preprocess_image(file, args.output_dir)
+    # Walk through the input directory recursively.
+    for root, dirs, files in os.walk(args.input_dir):
+        for file in files:
+            if file.endswith('.nii') or file.endswith('.nii.gz'):
+                file_path = os.path.join(root, file)
+                # Compute the file's relative directory with respect to the input directory.
+                relative_dir = os.path.relpath(root, args.input_dir)
+                # Build the corresponding output directory (preserving subfolder structure)
+                output_subfolder = os.path.join(args.output_dir, relative_dir)
+                preprocess_image(file_path, output_subfolder)
 
 
 if __name__ == "__main__":
