@@ -94,4 +94,5 @@ if args.moved:
 # save warp
 if args.warp:
     warp = warp.detach().cpu().numpy().squeeze()
+    warp = np.moveaxis(warp, 0, -1) 
     vxm.py.utils.save_volfile(warp, args.warp, fixed_affine)

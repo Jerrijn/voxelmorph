@@ -1,0 +1,30 @@
+#!/bin/bash
+#
+# SLURM directives for Voxelmorph training
+#SBATCH --job-name=voxelmorph_training         # Descriptive job name
+#SBATCH --partition=luna-gpu-long               # GPU-enabled partition for shorter jobs
+#SBATCH --gres=gpu:1g.10gb:1                     # Request one MIG GPU device (type 1g.10gb)
+#SBATCH --cpus-per-task=4                        # Allocate 4 CPU cores per task
+#SBATCH --mem=16G                                # Total memory allocation per node
+#SBATCH --time=0-16:00:00                        # Maximum wall time (0 days, 24 hours)
+#SBATCH --output=voxelmorph_training_%j.out       # Standard output and error log file (%j = job id)
+#SBATCH --mail-user=j.g.mandjes@amsterdamumc.nl       # Email for notifications (replace with your email)
+#SBATCH --mail-type=END,FAIL                      # Email when job ends or fails
+
+# Exit immediately if a command exits with a non-zero status
+set -eu
+
+# Load CUDA module (adjust version as needed)
+module load cuda/12.8
+module load Anaconda3/2024.02-1
+
+# Activate Conda environment
+conda activate voxelmorph
+
+# Navigate to the directory containing the training script
+cd /home/rth/jgmandjes/Voxelmorph/voxelmorph/scripts/torch
+
+# Execute the training script with 1000 epochs
+python train.py \
+        --img-list /home/rth/jgmandjes/Voxelmorph/voxelmorph/file_paths.txt \
+        --epochs 1500

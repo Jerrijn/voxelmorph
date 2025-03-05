@@ -105,10 +105,10 @@ def load_volfile(
         vol = np.squeeze(img.dataobj)
         affine = img.affine
     elif filename.endswith('.npy'):
-        vol = np.load(filename)
+        vol = np.load(filename, allow_pickle=True)
         affine = None
     elif filename.endswith('.npz'):
-        npz = np.load(filename)
+        npz = np.load(filename, allow_pickle=True)
         vol = next(iter(npz.values())) if len(npz.keys()) == 1 else npz[np_var]
         affine = None
     else:
