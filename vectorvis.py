@@ -2,76 +2,71 @@ import nibabel as nib
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.widgets import Slider
+import argparse
 
-# --- Load the vector field ---
-vec_img = nib.load("C:\\Users\\P096350\\OneDrive - Amsterdam UMC\\Documenten\\actualtest2_vector.nii")
-vec_data = vec_img.get_fdata()  # expected shape is (160, 160, 64, 3)
-print("Original vector field shape:", vec_data.shape)
-# If needed, convert from channel-first to channel-last (in this case it's already correct)
-if vec_data.shape[-1] != 3:
-    vector_field = np.moveaxis(vec_data, 0, -1)
-else:
-    vector_field = vec_data
-print("Converted vector field shape:", vector_field.shape)
-
-# --- Load the background (bowels) image ---
-bg_img = nib.load("C:\\Users\\P096350\\OneDrive - Amsterdam UMC\\Documenten\\actualtest2.nii")
-bg_data = bg_img.get_fdata()  # expected shape: (160, 160, 64)
-print("Background image shape:", bg_data.shape)
-
-def visualize_overlay(vector_field, background, step=5):
+def visualize_overlay(vector_field, background, step=5, output_path="visualization.png"):
     """
-    Visualize an anatomical background image with overlaid vector field arrows.
+    Visualize an anatomical background image with overlaid vector field arrows and save the visualization.
     
     Parameters:
         vector_field (np.ndarray): Array of shape (H, W, D, 3) representing the displacement field.
         background (np.ndarray): 3D image array of shape (H, W, D) as the background.
         step (int): Sampling step for quiver arrows to reduce clutter.
+        output_path (str): Path to save the visualization.
     """
+    vector_field = np.squeeze(vector_field)
+    background = np.squeeze(background)
+    
     H, W, D, _ = vector_field.shape
 
-    # Create the figure and adjust layout for slider.
+    # Create the figure
     fig, ax = plt.subplots()
-    plt.subplots_adjust(bottom=0.25)
     
-    # Initial slice index.
-    init_slice = 0
-    bg_slice = background[:, :, init_slice]
+    # Set slice to 50 (or the closest valid slice if D < 50)
+    slice_idx = min(43, D - 1)
+    bg_slice = background[:, :, slice_idx]
     im = ax.imshow(bg_slice, cmap='gray', origin='lower')
     
     # Prepare grid for quiver plot.
     X, Y = np.meshgrid(np.arange(W), np.arange(H))
-    vec_slice = vector_field[:, :, init_slice, :]
+    vec_slice = vector_field[:, :, slice_idx, :]
     ax.quiver(X[::step, ::step], Y[::step, ::step],
               vec_slice[::step, ::step, 0],
               vec_slice[::step, ::step, 1],
               color='r')
-    ax.set_title(f"Slice {init_slice}")
+    ax.set_title(f"Slice {slice_idx}")
     
-    # Create a slider to navigate through slices.
-    ax_slice = plt.axes([0.25, 0.1, 0.65, 0.03], facecolor='lightgoldenrodyellow')
-    slice_slider = Slider(ax_slice, 'Slice', 0, D - 1, valinit=init_slice, valstep=1)
-
-    def update(val):
-        slice_idx = int(slice_slider.val)
-        bg_slice = background[:, :, slice_idx]
-        im.set_data(bg_slice)
-        ax.set_title(f"Slice {slice_idx}")
-        
-        # Remove previous quiver arrows by iterating over a copy of ax.collections.
-        for coll in list(ax.collections):
-            coll.remove()
-        
-        # Get updated vector field slice.
-        vec_slice = vector_field[:, :, slice_idx, :]
-        ax.quiver(X[::step, ::step], Y[::step, ::step],
-                  vec_slice[::step, ::step, 0],
-                  vec_slice[::step, ::step, 1],
-                  color='lime')
-        fig.canvas.draw_idle()
-
-    slice_slider.on_changed(update)
+    # Save the visualization
+    fig.savefig(output_path)
+    print(f"Visualization saved as {output_path}")
+    
     plt.show()
 
-# Run the visualization.
-visualize_overlay(vector_field, bg_data, step=5)
+def main():
+    parser = argparse.ArgumentParser(description="Visualize vector field overlay on MRI scan.")
+    parser.add_argument("vector_field_path", type=str, help="Path to the vector field NIfTI file.")
+    parser.add_argument("background_path", type=str, help="Path to the background NIfTI file.")
+    args = parser.parse_args()
+
+    # Load the vector field
+    vec_img = nib.load(args.vector_field_path)
+    vec_data = np.squeeze(vec_img.get_fdata())
+    print("Original vector field shape:", vec_data.shape)
+    
+    # Ensure the correct format
+    if vec_data.shape[-1] != 3:
+        vector_field = np.moveaxis(vec_data, 0, -1)
+    else:
+        vector_field = vec_data
+    print("Converted vector field shape:", vector_field.shape)
+    
+    # Load the background image
+    bg_img = nib.load(args.background_path)
+    bg_data = np.squeeze(bg_img.get_fdata())
+    print("Background image shape:", bg_data.shape)
+
+    # Run visualization and save the result
+    visualize_overlay(vector_field, bg_data, step=5, output_path="visualization.png")
+
+if __name__ == "__main__":
+    main()

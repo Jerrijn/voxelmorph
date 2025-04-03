@@ -45,6 +45,7 @@ import torch
 os.environ['NEURITE_BACKEND'] = 'pytorch'
 os.environ['VXM_BACKEND'] = 'pytorch'
 import voxelmorph as vxm  # nopep8
+from voxelmorph.losses import MutualInformation, InverseConsistencyLoss, BendingEnergyLoss
 
 # parse the commandline
 parser = argparse.ArgumentParser()
@@ -180,6 +181,18 @@ else:
 losses += [vxm.losses.Grad('l2', loss_mult=args.int_downsize).loss]
 weights += [args.weight]
 
+# Define loss weights
+lambda_mi = 0.1       # weight for Mutual Information loss
+lambda_bend = 0.01    # weight for Bending Energy loss
+# lambda_ic = 0.05   # weight for Inverse Consistency loss
+
+# NEW: Instantiate new loss functions
+mi_loss = MutualInformation(bins=32, sigma=0.02, eps=1e-10, device=device)
+# For inverse consistency, you would need your model to output both forward and inverse displacement fields.
+# Uncomment and use the following if you have such outputs:
+# inv_consistency_loss = InverseConsistencyLoss()
+bend_loss = BendingEnergyLoss
+
 # training loops
 for epoch in range(args.initial_epoch, args.epochs):
 
@@ -210,6 +223,11 @@ for epoch in range(args.initial_epoch, args.epochs):
             curr_loss = loss_function(y_true[n], y_pred[n]) * weights[n]
             loss_list.append(curr_loss.item())
             loss += curr_loss
+
+        loss_mi = mi_loss.loss(y_true[0], y_pred[0])
+        loss_bend = bend_loss(y_pred[1])
+
+        loss += lambda_mi * loss_mi + lambda_bend * loss_bend
 
         epoch_loss.append(loss_list)
         epoch_total_loss.append(loss.item())
