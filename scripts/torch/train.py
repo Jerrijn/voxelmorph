@@ -45,7 +45,6 @@ import torch
 os.environ['NEURITE_BACKEND'] = 'pytorch'
 os.environ['VXM_BACKEND'] = 'pytorch'
 import voxelmorph as vxm  # nopep8
-from voxelmorph.losses import MutualInformation, InverseConsistencyLoss, BendingEnergyLoss
 
 # parse the commandline
 parser = argparse.ArgumentParser()
@@ -90,6 +89,28 @@ parser.add_argument('--image-loss', default='mse',
                     help='image reconstruction loss - can be mse or ncc (default: mse)')
 parser.add_argument('--lambda', type=float, dest='weight', default=0.01,
                     help='weight of deformation loss (default: 0.01)')
+# Add new loss hyperparameters
+parser.add_argument('--use-mi', action='store_true',
+                    help='use mutual information loss')
+parser.add_argument('--lambda-mi', type=float, default=0.1,
+                    help='weight of mutual information loss (default: 0.1)')
+parser.add_argument('--use-bending', action='store_true',
+                    help='use bending energy loss')
+parser.add_argument('--lambda-bending', type=float, default=0.01,
+                    help='weight of bending energy loss (default: 0.01)')
+# parser.add_argument('--use-ic', action='store_true',
+#                     help='use inverse consistency loss')
+# parser.add_argument('--lambda-ic', type=float, default=0.05,
+#                     help='weight of inverse consistency loss (default: 0.05)')
+
+# Add command line arguments for segmentation maps
+parser.add_argument('--seg-list', help='line-separated list of segmentation files')
+parser.add_argument('--seg-prefix', help='optional segmentation file prefix')
+parser.add_argument('--seg-suffix', help='optional segmentation file suffix')
+parser.add_argument('--use-seg', action='store_true', help='use segmentation maps as additional input')
+parser.add_argument('--seg-weight', type=float, default=0.5, 
+                    help='weight for segmentation-based loss (default: 0.5)')
+
 args = parser.parse_args()
 
 bidir = args.bidir
@@ -99,20 +120,42 @@ train_files = vxm.py.utils.read_file_list(args.img_list, prefix=args.img_prefix,
                                           suffix=args.img_suffix)
 assert len(train_files) > 0, 'Could not find any training data.'
 
+# Load segmentation files if specified
+seg_files = None
+if args.use_seg and args.seg_list:
+    seg_files = vxm.py.utils.read_file_list(args.seg_list, prefix=args.seg_prefix,
+                                           suffix=args.seg_suffix)
+    assert len(seg_files) == len(train_files), 'Number of segmentation files must match image files.'
+
 # no need to append an extra feature axis if data is multichannel
 add_feat_axis = not args.multichannel
 
 if args.atlas:
     # scan-to-atlas generator
     atlas = vxm.py.utils.load_volfile(args.atlas, np_var='vol',
-                                      add_batch_axis=True, add_feat_axis=add_feat_axis)
-    generator = vxm.generators.scan_to_atlas(train_files, atlas,
-                                             batch_size=args.batch_size, bidir=args.bidir,
-                                             add_feat_axis=add_feat_axis)
+                                     add_batch_axis=True, add_feat_axis=add_feat_axis)
+    
+    if args.use_seg and args.seg_list:
+        # Custom generator that includes segmentation maps
+        generator = vxm.generators.scan_to_atlas_with_segs(
+            train_files, atlas, seg_files=seg_files,
+            batch_size=args.batch_size, bidir=args.bidir,
+            add_feat_axis=add_feat_axis)
+    else:
+        generator = vxm.generators.scan_to_atlas(
+            train_files, atlas, batch_size=args.batch_size, 
+            bidir=args.bidir, add_feat_axis=add_feat_axis)
 else:
     # scan-to-scan generator
-    generator = vxm.generators.scan_to_scan(
-        train_files, batch_size=args.batch_size, bidir=args.bidir, add_feat_axis=add_feat_axis)
+    if args.use_seg and args.seg_list:
+        # Custom generator that includes segmentation maps
+        generator = vxm.generators.scan_to_scan_with_segs(
+            train_files, seg_files=seg_files, batch_size=args.batch_size, 
+            bidir=args.bidir, add_feat_axis=add_feat_axis)
+    else:
+        generator = vxm.generators.scan_to_scan(
+            train_files, batch_size=args.batch_size, 
+            bidir=args.bidir, add_feat_axis=add_feat_axis)
 
 # extract shape from sampled input
 inshape = next(generator)[0][0].shape[1:-1]
@@ -141,13 +184,25 @@ if args.load_model:
     model = vxm.networks.VxmDense.load(args.load_model, device)
 else:
     # otherwise configure new model
-    model = vxm.networks.VxmDense(
-        inshape=inshape,
-        nb_unet_features=[enc_nf, dec_nf],
-        bidir=bidir,
-        int_steps=args.int_steps,
-        int_downsize=args.int_downsize
-    )
+    if args.use_seg:
+        # Create a model that accepts segmentation maps as additional input
+        model = vxm.networks.VxmDenseSegmentation(
+            inshape=inshape,
+            nb_unet_features=[enc_nf, dec_nf],
+            bidir=bidir,
+            int_steps=args.int_steps,
+            int_downsize=args.int_downsize,
+            seg_weight=args.seg_weight
+        )
+    else:
+        # Standard model without segmentation
+        model = vxm.networks.VxmDense(
+            inshape=inshape,
+            nb_unet_features=[enc_nf, dec_nf],
+            bidir=bidir,
+            int_steps=args.int_steps,
+            int_downsize=args.int_downsize
+        )
 
 if nb_gpus > 1:
     # use multiple GPUs via DataParallel
@@ -181,17 +236,24 @@ else:
 losses += [vxm.losses.Grad('l2', loss_mult=args.int_downsize).loss]
 weights += [args.weight]
 
-# Define loss weights
-lambda_mi = 0.1       # weight for Mutual Information loss
-lambda_bend = 0.01    # weight for Bending Energy loss
-# lambda_ic = 0.05   # weight for Inverse Consistency loss
+# Define loss weights from command line arguments
+lambda_mi = args.lambda_mi if args.use_mi else 0.0
+lambda_bend = args.lambda_bending if args.use_bending else 0.0
+# lambda_ic = args.lambda_ic if args.use_ic else 0.0
 
 # NEW: Instantiate new loss functions
-mi_loss = MutualInformation(bins=32, sigma=0.02, eps=1e-10, device=device)
+mi_loss = vxm.losses.MutualInformation(bins=32, sigma=0.02, eps=1e-10, device=device) if args.use_mi else None
 # For inverse consistency, you would need your model to output both forward and inverse displacement fields.
 # Uncomment and use the following if you have such outputs:
-# inv_consistency_loss = InverseConsistencyLoss()
-bend_loss = BendingEnergyLoss
+# inv_consistency_loss = InverseConsistencyLoss() if args.use_ic else None
+bend_loss = vxm.losses.BendingEnergyLoss() if args.use_bending else None
+
+# Add to the losses section
+if args.use_seg:
+    # Add Dice loss for segmentation maps
+    dice_loss = vxm.losses.Dice().loss
+    losses += [dice_loss]
+    weights += [args.seg_weight]
 
 # training loops
 for epoch in range(args.initial_epoch, args.epochs):
@@ -203,6 +265,10 @@ for epoch in range(args.initial_epoch, args.epochs):
     epoch_loss = []
     epoch_total_loss = []
     epoch_step_time = []
+    
+    # Add tracking for additional losses
+    epoch_mi_loss = [] if args.use_mi else None
+    epoch_bend_loss = [] if args.use_bending else None
 
     for step in range(args.steps_per_epoch):
 
@@ -224,10 +290,22 @@ for epoch in range(args.initial_epoch, args.epochs):
             loss_list.append(curr_loss.item())
             loss += curr_loss
 
-        loss_mi = mi_loss.loss(y_true[0], y_pred[0])
-        loss_bend = bend_loss(y_pred[1])
-
-        loss += lambda_mi * loss_mi + lambda_bend * loss_bend
+        # Add additional losses if enabled
+        if args.use_mi:
+            loss_mi = mi_loss.loss(y_true[0], y_pred[0])
+            loss += lambda_mi * loss_mi
+            epoch_mi_loss.append(loss_mi.item())
+        
+        if args.use_bending:
+            loss_bend = bend_loss(y_pred[1])  # Using the forward method
+            loss += lambda_bend * loss_bend
+            epoch_bend_loss.append(loss_bend.item())
+        
+        # if args.use_ic and bidir:
+        #     # This assumes y_pred contains both forward and backward flows
+        #     # Adjust indices as needed based on your model's output structure
+        #     loss_ic = inv_consistency_loss(y_pred[1], y_pred[2])
+        #     loss += lambda_ic * loss_ic
 
         epoch_loss.append(loss_list)
         epoch_total_loss.append(loss.item())
@@ -244,7 +322,19 @@ for epoch in range(args.initial_epoch, args.epochs):
     epoch_info = 'Epoch %d/%d' % (epoch + 1, args.epochs)
     time_info = '%.4f sec/step' % np.mean(epoch_step_time)
     losses_info = ', '.join(['%.4e' % f for f in np.mean(epoch_loss, axis=0)])
-    loss_info = 'loss: %.4e  (%s)' % (np.mean(epoch_total_loss), losses_info)
+    
+    # Add additional loss info to the print statement
+    additional_losses = []
+    if args.use_mi:
+        additional_losses.append('MI: %.4e' % np.mean(epoch_mi_loss))
+    if args.use_bending:
+        additional_losses.append('Bend: %.4e' % np.mean(epoch_bend_loss))
+    
+    additional_info = ''
+    if additional_losses:
+        additional_info = '  Additional losses: ' + ', '.join(additional_losses)
+    
+    loss_info = 'loss: %.4e  (%s)%s' % (np.mean(epoch_total_loss), losses_info, additional_info)
     print(' - '.join((epoch_info, time_info, loss_info)), flush=True)
 
 # final model save

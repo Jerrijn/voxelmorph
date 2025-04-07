@@ -304,3 +304,11 @@ class BendingEnergyLoss(nn.Module):
                 diff_ij = torch.diff(diff_i, n=1, dim=j+2)
                 loss = loss + 2 * diff_ij.pow(2).mean()
         return loss
+    
+    # Add loss method for consistency with other loss classes
+    def loss(self, _, y_pred):
+        """
+        Wrapper around forward method to maintain consistent API with other loss classes.
+        The first argument is ignored (typically y_true) since bending energy only depends on the predicted field.
+        """
+        return self.forward(y_pred)

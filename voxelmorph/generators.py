@@ -510,3 +510,174 @@ def custom_scan_to_scan(file_list, batch_size=1, target_shape=(160,160,64), mult
         moving_batch = np.stack(moving_batch, axis=0)
         fixed_batch = np.stack(fixed_batch, axis=0)
         yield (moving_batch, fixed_batch)
+
+
+def scan_to_scan_with_segs(
+    vol_names, seg_names, batch_size=1, bidir=False, prob_same=0, no_warp=False, **kwargs
+):
+    """
+    Generator for scan-to-scan registration with segmentation maps.
+
+    Parameters:
+        vol_names: List of volume files to load, or list of preloaded volumes.
+        seg_names: List of segmentation files to load, or list of preloaded segmentations.
+        bidir: Yield input image as output for bidirectional models. Default is False.
+        batch_size: Batch size. Default is 1.
+        prob_same: Induced probability that source and target inputs are the same. Default is 0.
+        no_warp: Excludes null warp in output list if set to True (for affine training). 
+            Default is False.
+        kwargs: Forwarded to the internal volgen generator.
+    """
+    zeros = None
+    vol_gen = volgen(vol_names, batch_size=batch_size, **kwargs)
+    seg_gen = volgen(seg_names, batch_size=batch_size, **kwargs)
+    
+    while True:
+        # Get volumes
+        scan1 = next(vol_gen)[0]
+        scan2 = next(vol_gen)[0]
+        
+        # Get corresponding segmentations
+        seg1 = next(seg_gen)[0]
+        seg2 = next(seg_gen)[0]
+
+        # some induced chance of making source and target equal
+        if prob_same > 0 and np.random.rand() < prob_same:
+            if np.random.rand() > 0.5:
+                scan1 = scan2
+                seg1 = seg2
+            else:
+                scan2 = scan1
+                seg2 = seg1
+
+        # cache zeros
+        if not no_warp and zeros is None:
+            shape = scan1.shape[1:-1]
+            zeros = np.zeros((batch_size, *shape, len(shape)))
+
+        invols = [scan1, scan2, seg1, seg2]
+        
+        if bidir:
+            outvols = [scan2, scan1]
+        else:
+            outvols = [scan2]
+            
+        if not no_warp:
+            outvols.append(zeros)
+
+        yield (invols, outvols)
+
+
+def scan_to_atlas_with_segs(
+    vol_names, atlas, seg_names, atlas_seg=None, bidir=False, 
+    batch_size=1, no_warp=False, **kwargs
+):
+    """
+    Generator for scan-to-atlas registration with segmentation maps.
+
+    Parameters:
+        vol_names: List of volume files to load, or list of preloaded volumes.
+        atlas: Atlas volume data.
+        seg_names: List of segmentation files to load, or list of preloaded segmentations.
+        atlas_seg: Atlas segmentation data. Default is None.
+        bidir: Yield input image as output for bidirectional models. Default is False.
+        batch_size: Batch size. Default is 1.
+        no_warp: Excludes null warp in output list if set to True (for affine training). 
+            Default is False.
+        kwargs: Forwarded to the internal volgen generator.
+    """
+    shape = atlas.shape[1:-1]
+    zeros = np.zeros((batch_size, *shape, len(shape)))
+    atlas = np.repeat(atlas, batch_size, axis=0)
+    
+    # Repeat atlas segmentation if provided
+    if atlas_seg is not None:
+        atlas_seg = np.repeat(atlas_seg, batch_size, axis=0)
+    
+    vol_gen = volgen(vol_names, batch_size=batch_size, **kwargs)
+    seg_gen = volgen(seg_names, batch_size=batch_size, **kwargs)
+    
+    while True:
+        scan = next(vol_gen)[0]
+        seg = next(seg_gen)[0]
+        
+        invols = [scan, atlas, seg]
+        if atlas_seg is not None:
+            invols.append(atlas_seg)
+            
+        if bidir:
+            outvols = [atlas, scan]
+        else:
+            outvols = [atlas]
+            
+        if not no_warp:
+            outvols.append(zeros)
+            
+        yield (invols, outvols)
+
+
+def semisupervised_with_segs(
+    vol_names, seg_names, labels, atlas_file=None, atlas_seg_file=None, 
+    downsize=2, batch_size=1, **kwargs
+):
+    """
+    Generator for semi-supervised registration training using segmentation maps.
+    
+    Parameters:
+        vol_names: List of volume files to load, or list of preloaded volumes.
+        seg_names: List of segmentation files to load, or list of preloaded segmentations.
+        labels: Array of discrete label values to use in training.
+        atlas_file: Atlas npz file for scan-to-atlas training. Default is None.
+        atlas_seg_file: Atlas segmentation file. Default is None.
+        downsize: Downsize factor for segmentations. Default is 2.
+        batch_size: Batch size. Default is 1.
+        kwargs: Forwarded to the internal volgen generator.
+    """
+    # configure base generator
+    vol_gen = volgen(vol_names, batch_size=batch_size, **kwargs)
+    seg_gen = volgen(seg_names, batch_size=batch_size, **kwargs)
+    zeros = None
+
+    # internal utility to generate downsampled prob seg from discrete seg
+    def split_seg(seg):
+        prob_seg = np.zeros((*seg.shape[:4], len(labels)))
+        for i, label in enumerate(labels):
+            prob_seg[0, ..., i] = seg[0, ..., 0] == label
+        return prob_seg[:, ::downsize, ::downsize, ::downsize, :]
+
+    # cache target vols and segs if atlas is supplied
+    if atlas_file:
+        trg_vol = py.utils.load_volfile(atlas_file, np_var='vol',
+                                        add_batch_axis=True, add_feat_axis=True)
+        
+        if atlas_seg_file:
+            trg_seg = py.utils.load_volfile(atlas_seg_file, np_var='seg',
+                                            add_batch_axis=True, add_feat_axis=True)
+            trg_seg = split_seg(trg_seg)
+        else:
+            trg_seg = None
+
+    while True:
+        # load source vol and seg
+        src_vol = next(vol_gen)[0]
+        src_seg = next(seg_gen)[0]
+        src_seg_prob = split_seg(src_seg)
+
+        # load target vol and seg (if not provided by atlas)
+        if not atlas_file:
+            trg_vol = next(vol_gen)[0]
+            trg_seg = next(seg_gen)[0]
+            trg_seg = split_seg(trg_seg)
+
+        # cache zeros
+        if zeros is None:
+            shape = src_vol.shape[1:-1]
+            zeros = np.zeros((batch_size, *shape, len(shape)))
+
+        invols = [src_vol, trg_vol, src_seg, src_seg_prob]
+        if trg_seg is not None:
+            invols.append(trg_seg)
+            
+        outvols = [trg_vol, zeros, trg_seg if trg_seg is not None else src_seg_prob]
+        
+        yield (invols, outvols)
