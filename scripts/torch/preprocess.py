@@ -56,14 +56,16 @@ def pad_or_crop_volume(vol, factor=16):
 def preprocess_image(file_path, output_dir):
     """
     Loads, normalizes, and preprocesses an image, then saves the result and metadata.
-    
-    Parameters:
-        file_path (str): Path to the input NIfTI image.
-        output_dir (str): Output folder where the preprocessed image will be saved.
+    Skips non-3D images.
     """
     img = nib.load(file_path)
     vol = img.get_fdata()
-    
+
+    # Skip non-3D volumes
+    if vol.ndim != 3:
+        print(f"Skipping (non-3D): {file_path} with shape {vol.shape}")
+        return
+
     # Normalize intensity between 0 and 1
     vol = (vol - np.min(vol)) / (np.max(vol) - np.min(vol) + 1e-5)
 
@@ -89,6 +91,7 @@ def preprocess_image(file_path, output_dir):
     np.save(metadata_file, {'original_shape': original_shape, 'affine': img.affine})
 
     print(f"Processed: {file_path} -> {preprocessed_file}")
+
 
 
 def main():

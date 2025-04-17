@@ -142,8 +142,8 @@ class MutualInformation:
 
     def loss(self, y_true, y_pred):
         B = y_true.size(0)
-        y_true = y_true.view(B, -1).unsqueeze(-1)  # shape: [B, N, 1]
-        y_pred = y_pred.view(B, -1).unsqueeze(-1)  # shape: [B, N, 1]
+        y_true = y_true.reshape(B, -1).unsqueeze(-1)  # shape: [B, N, 1]
+        y_pred = y_pred.reshape(B, -1).unsqueeze(-1)  # shape: [B, N, 1]
 
         # Soft assignments using a Gaussian kernel (Parzen window)
         soft_true = torch.exp(-((y_true - self.bin_centers)**2) / (2 * self.sigma**2))

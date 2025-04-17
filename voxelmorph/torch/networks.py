@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
 from .. import default_unet_features
+
 from . import layers
 from .modelio import LoadableModel, store_config_args
 
@@ -282,7 +283,7 @@ class VxmDense(LoadableModel):
 
         # return non-integrated flow field if training
         if not registration:
-            return (y_source, y_target, preint_flow) if self.bidir else (y_source, preint_flow)
+            return (y_source, y_target, pos_flow, neg_flow) if self.bidir else (y_source, preint_flow)
         else:
             return y_source, pos_flow
 
