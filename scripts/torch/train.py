@@ -50,8 +50,10 @@ import voxelmorph as vxm  # nopep8
 import re
 from collections import defaultdict
 
-import re
-from collections import defaultdict
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.benchmark     = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32      = True
 
 class ScanToScanDataset(Dataset):
     def __init__(self, image_paths, seg_paths=None, use_segs=False,
@@ -113,6 +115,9 @@ class ScanToScanDataset(Dataset):
         moving = vxm.py.utils.load_volfile(moving_path, add_batch_axis=False, add_feat_axis=self.add_feat_axis)
         fixed = vxm.py.utils.load_volfile(fixed_path, add_batch_axis=False, add_feat_axis=self.add_feat_axis)
 
+        moving = (moving - moving.mean())/(moving.std() + 1e-6)
+        fixed  = (fixed  - fixed.mean()) /(fixed.std()  + 1e-6)
+
         inputs = [moving, fixed]
         outputs = [fixed]
 
@@ -128,8 +133,8 @@ class ScanToScanDataset(Dataset):
             if self.bidir:
                 outputs.append(moving_seg)
 
-        inputs = [torch.from_numpy(x).float().permute(3, 0, 1, 2) for x in inputs]
-        outputs = [torch.from_numpy(x).float().permute(3, 0, 1, 2) for x in outputs]
+        inputs = [torch.from_numpy(x).float().permute(3, 0, 1, 2).contiguous() for x in inputs]
+        outputs = [torch.from_numpy(x).float().permute(3, 0, 1, 2).contiguous() for x in outputs]
 
         return inputs, outputs
 
@@ -234,9 +239,23 @@ def main():
 
     bidir = args.bidir
 
+    # no need to append an extra feature axis if data is multichannel
+    add_feat_axis = not args.multichannel
+
     # load and prepare training data
     train_files = vxm.py.utils.read_file_list(args.img_list, prefix=args.img_prefix,
                                             suffix=args.img_suffix)
+        # —— quick sanity check on first few vols ——
+    sample_paths = train_files[:5]
+    mins, maxs = [], []
+    for p in sample_paths:
+        vol = vxm.py.utils.load_volfile(p,
+                                        add_batch_axis=False,
+                                        add_feat_axis=add_feat_axis)
+        mins.append(float(vol.min()))
+        maxs.append(float(vol.max()))
+    print(f"[Data check] intensity range across first 5 vols: {min(mins):.4f} → {max(maxs):.4f}")
+
     assert len(train_files) > 0, 'Could not find any training data.'
 
     # Load segmentation files if specified
@@ -246,8 +265,7 @@ def main():
                                             suffix=args.seg_suffix)
         assert len(seg_files) == len(train_files), 'Number of segmentation files must match image files.'
 
-    # no need to append an extra feature axis if data is multichannel
-    add_feat_axis = not args.multichannel
+    
 
     from torch.utils.data import DataLoader
     image_paths = vxm.py.utils.read_file_list(args.img_list, prefix=args.img_prefix, suffix=args.img_suffix)
@@ -275,7 +293,12 @@ def main():
 
 
 
-    generator = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    generator = DataLoader(dataset, 
+                           batch_size=args.batch_size, 
+                           num_workers=10, 
+                           pin_memory=True,
+                           persistent_workers=True,
+                           prefetch_factor=4)
 
     # extract shape from sampled input
     sample_input, _ = next(iter(generator))  # One batch
@@ -331,19 +354,22 @@ def main():
         model.save = model.module.save
 
     # prepare the model for training and send to device
-    model.to(device)
+    from torch.cuda.amp import autocast, GradScaler
+    model.to(device, memory_format=torch.channels_last_3d)
+    scaler = GradScaler(init_scale=2**8)
+    torch.autograd.set_detect_anomaly(True)
     model.train()
     from datetime import datetime
 
     # Custom base log directory
-    log_base = r"C:\Users\P096350\OneDrive - Amsterdam UMC\Bureaublad\logs"
+    log_base = r"C:\Users\P096350\Documents\logs"
 
     # Timestamp for unique run folders
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     log_dir = os.path.join(log_base, timestamp)
 
     # Create writer
-    writer = SummaryWriter(log_dir=log_dir)
+    # writer = SummaryWriter(log_dir=log_dir)
     print("✅ Writer created:", log_dir)
 
     # set optimizer
@@ -351,7 +377,11 @@ def main():
 
     # prepare image loss
     if args.image_loss == 'ncc':
-        image_loss_func = vxm.losses.NCC().loss
+        ncc_obj = vxm.losses.NCC()  # default NCC implementation
+        def image_loss_func(y_true, y_pred):
+            raw = ncc_obj.loss(y_true, y_pred)
+            # divide by max|raw| + ε to avoid any Inf/NaN
+            return raw / (raw.abs().max().clamp(min=1e-5))
     elif args.image_loss == 'mse':
         image_loss_func = vxm.losses.MSE().loss
     else:
@@ -397,7 +427,7 @@ def main():
 
     # training loops
     for epoch in range(args.initial_epoch, args.epochs):
-        writer.add_scalar("Training/Epoch", epoch, epoch)
+        # writer.add_scalar("Training/Epoch", epoch, epoch)
 
         # save model checkpoint
         if epoch % 20 == 0:
@@ -414,138 +444,142 @@ def main():
         epoch_bend_loss = [] if args.use_bending else None
         epoch_ic_loss = [] if args.use_ic else None
 
+        from torch.profiler import profile, record_function, ProfilerActivity
 
-        for step, (inputs, y_true) in enumerate(generator):
-            if step >= args.steps_per_epoch:
-                break
+        # … inside your training loop, instead of your old profiling code …
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=True
+        ) as prof:
+            for step, (inputs, y_true) in enumerate(generator):
+                # stop after a few steps
+                if step == 10:
+                    break
 
-            step_start_time = time.time()
+                step_start_time = time.time()
 
-            # Send to GPU
-            inputs = [d.to(device, non_blocking=True) for d in inputs]
-            y_true = [d.to(device, non_blocking=True) for d in y_true]
+                with record_function("step"), autocast():
+                    # **FIRST LINE**: move data to GPU
+                    inputs = [
+                        d.to(device, non_blocking=True, memory_format=torch.channels_last_3d)
+                        for d in inputs
+                    ]
+                    y_true = [
+                        d.to(device, non_blocking=True, memory_format=torch.channels_last_3d)
+                        for d in y_true]
 
-            # Log image stats for debugging
-            # print(f"[{epoch}:{step}] Moving image min/max: {inputs[0].min().item():.4f} / {inputs[0].max().item():.4f}")
-            # print(f"[{epoch}:{step}] Fixed image min/max:  {inputs[1].min().item():.4f} / {inputs[1].max().item():.4f}")
+                    optimizer.zero_grad()
+                    
+                
+                    y_pred = model(*inputs)
 
-            # forward
-            y_pred = model(*inputs)
+                    # Determine bidirectional mode based on output length
+                    is_bidir = len(y_pred) == 4
 
-            # Determine bidirectional mode based on output length
-            is_bidir = len(y_pred) == 4
+                    # Extract flows
+                    if is_bidir:
+                        flow_fwd = y_pred[2]
+                        flow_bwd = y_pred[3]
+                    else:
+                        flow_fwd = y_pred[1]
+                        flow_bwd = None  # not available
+                    # Compute and log Jacobian determinants
+                    import torch.nn.functional as F
 
-            # Extract flows
-            if is_bidir:
-                flow_fwd = y_pred[2]
-                flow_bwd = y_pred[3]
-            else:
-                flow_fwd = y_pred[1]
-                flow_bwd = None  # not available
+                    # def compute_jacobian_determinant(flow):
+                    #     """
+                    #     Compute the Jacobian determinant of a displacement field using finite differences.
+                    #     Assumes input shape: (B, 3, D, H, W)
+                    #     """
+                    #     # Compute gradients along each axis
+                    #     dx = flow[:, :, 1:, :-1, :-1] - flow[:, :, :-1, :-1, :-1]
+                    #     dy = flow[:, :, :-1, 1:, :-1] - flow[:, :, :-1, :-1, :-1]
+                    #     dz = flow[:, :, :-1, :-1, 1:] - flow[:, :, :-1, :-1, :-1]
 
-            # Log flow magnitude histograms
-            writer.add_histogram('flow_fwd/magnitude', torch.norm(flow_fwd, dim=1), epoch * args.steps_per_epoch + step)
-            if flow_bwd is not None:
-                writer.add_histogram('flow_bwd/magnitude', torch.norm(flow_bwd, dim=1), epoch * args.steps_per_epoch + step)
+                    #     # Construct Jacobian matrix J with shape (B, D-1, H-1, W-1, 3, 3)
+                    #     J = torch.stack((dx, dy, dz), dim=-1)  # (B, 3, D-1, H-1, W-1, 3)
+                    #     J = J.permute(0, 2, 3, 4, 1, 5)        # -> (B, D-1, H-1, W-1, 3, 3)
 
-            # Compute and log Jacobian determinants
-            import torch.nn.functional as F
+                    #     # Compute the determinant of J
+                    #     jac_det = torch.linalg.det(J)         # (B, D-1, H-1, W-1)
 
-            def compute_jacobian_determinant(flow):
-                """
-                Compute the Jacobian determinant of a displacement field using finite differences.
-                Assumes input shape: (B, 3, D, H, W)
-                """
-                # Compute gradients along each axis
-                dx = flow[:, :, 1:, :-1, :-1] - flow[:, :, :-1, :-1, :-1]
-                dy = flow[:, :, :-1, 1:, :-1] - flow[:, :, :-1, :-1, :-1]
-                dz = flow[:, :, :-1, :-1, 1:] - flow[:, :, :-1, :-1, :-1]
-
-                # Construct Jacobian matrix J with shape (B, D-1, H-1, W-1, 3, 3)
-                J = torch.stack((dx, dy, dz), dim=-1)  # (B, 3, D-1, H-1, W-1, 3)
-                J = J.permute(0, 2, 3, 4, 1, 5)        # -> (B, D-1, H-1, W-1, 3, 3)
-
-                # Compute the determinant of J
-                jac_det = torch.linalg.det(J)         # (B, D-1, H-1, W-1)
-
-                return jac_det
-
-
-            jac_fwd = compute_jacobian_determinant(flow_fwd)
-            writer.add_histogram('jacobian_fwd/values', jac_fwd, epoch * args.steps_per_epoch + step)
-            writer.add_scalar('jacobian_fwd/folding_ratio', (jac_fwd < 0).float().mean().item(), epoch * args.steps_per_epoch + step)
-
-            if flow_bwd is not None:
-                jac_bwd = compute_jacobian_determinant(flow_bwd)
-                writer.add_histogram('jacobian_bwd/values', jac_bwd, epoch * args.steps_per_epoch + step)
-                writer.add_scalar('jacobian_bwd/folding_ratio', (jac_bwd < 0).float().mean().item(), epoch * args.steps_per_epoch + step)
+                    #     return jac_det
 
 
-            # compute loss
-            loss = 0
-            loss_list = []
-            # image losses (bidir-aware)
-            curr_loss = losses[0](y_true[0], y_pred[0]) * weights[0]
-            loss_list.append(curr_loss.item())
-            loss += curr_loss
+                    # jac_fwd = compute_jacobian_determinant(flow_fwd)
+                    # writer.add_histogram('jacobian_fwd/values', jac_fwd, epoch * args.steps_per_epoch + step)
+                    # writer.add_scalar('jacobian_fwd/folding_ratio', (jac_fwd < 0).float().mean().item(), epoch * args.steps_per_epoch + step)
 
-            curr_loss = losses[1](y_true[1], y_pred[1]) * weights[1]
-            loss_list.append(curr_loss.item())
-            loss += curr_loss
+                    # if flow_bwd is not None:
+                    #     jac_bwd = compute_jacobian_determinant(flow_bwd)
+                    #     writer.add_histogram('jacobian_bwd/values', jac_bwd, epoch * args.steps_per_epoch + step)
+                    #     writer.add_scalar('jacobian_bwd/folding_ratio', (jac_bwd < 0).float().mean().item(), epoch * args.steps_per_epoch + step)
 
-            # deformation loss (only uses flow field)
-            curr_loss = losses[2](None, y_pred[2]) * weights[2]
-            loss_list.append(curr_loss.item())
-            loss += curr_loss
 
-            # inverse consistency loss
-            if args.use_ic and bidir:
-                loss_ic = inv_consistency_loss(y_pred[2], y_pred[3])
-                loss += args.lambda_ic * loss_ic
-                epoch_ic_loss.append(loss_ic.item())
+                    # compute loss
+                    loss = 0
+                    loss_list = []
+                    # image losses (bidir-aware)
+                    curr_loss = losses[0](y_true[0], y_pred[0]) * weights[0]
+                    loss_list.append(curr_loss.item())
+                    loss += curr_loss
 
-            # extra losses
-            if args.use_mi:
-                loss_mi = mi_loss.loss(y_true[0], y_pred[0])
-                loss += lambda_mi * loss_mi
-                epoch_mi_loss.append(loss_mi.item())
+                    curr_loss = losses[1](y_true[1], y_pred[1]) * weights[1]
+                    loss_list.append(curr_loss.item())
+                    loss += curr_loss
 
-            if args.use_bending:
-                loss_bend = bend_loss(y_pred[1])
-                loss += lambda_bend * loss_bend
-                epoch_bend_loss.append(loss_bend.item())
+                    # deformation loss (only uses flow field)
+                    curr_loss = losses[2](None, y_pred[2]) * weights[2]
+                    loss_list.append(curr_loss.item())
+                    loss += curr_loss
 
-            # Visualization: log middle slice images
-            if step == 0:
-                mid_slice = inputs[0].shape[-1] // 2
-                writer.add_image('moving', inputs[0][0, 0, :, :, mid_slice], epoch, dataformats='HW')
-                writer.add_image('fixed', inputs[1][0, 0, :, :, mid_slice], epoch, dataformats='HW')
-                writer.add_image('warped', y_pred[0][0, 0, :, :, mid_slice], epoch, dataformats='HW')
+                    # inverse consistency loss
+                    if args.use_ic and bidir:
+                        loss_ic = inv_consistency_loss(y_pred[2], y_pred[3])
+                        loss += args.lambda_ic * loss_ic
+                        epoch_ic_loss.append(loss_ic.item())
 
-            # backprop
-            optimizer.zero_grad()
-            loss.backward()
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)
-                    total_norm += param_norm.item() ** 2
-                    if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
-                        raise ValueError("NaN or Inf detected in gradients!")
-            total_norm = total_norm ** 0.5
-            writer.add_scalar('Gradient/global_norm', total_norm, epoch * args.steps_per_epoch + step)
+                    # extra losses
+                    if args.use_mi:
+                        loss_mi = mi_loss.loss(y_true[0], y_pred[0])
+                        loss += lambda_mi * loss_mi
+                        epoch_mi_loss.append(loss_mi.item())
 
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    grad_norm = param.grad.data.norm(2).item()
-                    writer.add_scalar(f'GradNorm/{name}', grad_norm, epoch * args.steps_per_epoch + step)
+                    if args.use_bending:
+                        loss_bend = bend_loss(y_pred[1])
+                        loss += lambda_bend * loss_bend
+                        epoch_bend_loss.append(loss_bend.item())
 
-            optimizer.step()
+                    # Visualization: log middle slice images
+                    # if step == 0:
+                    #     mid_slice = inputs[0].shape[-1] // 2
+                    #     writer.add_image('moving', inputs[0][0, 0, :, :, mid_slice], epoch, dataformats='HW')
+                    #     writer.add_image('fixed', inputs[1][0, 0, :, :, mid_slice], epoch, dataformats='HW')
+                    #     writer.add_image('warped', y_pred[0][0, 0, :, :, mid_slice], epoch, dataformats='HW')
+
+                # backprop
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                torch.cuda.synchronize()
+                prof.step()
+
+            if step % 10 == 0:
+                total_norm = torch.norm(torch.stack([p.grad.data.norm(2) for p in model.parameters() if p.grad is not None])).item()
+                # writer.add_scalar('Gradient/global_norm', total_norm, epoch * args.steps_per_epoch + step)
+
+                for name, param in model.named_parameters():
+                    if param.grad is not None and 'coder' not in name:
+                        grad_norm = param.grad.data.norm(2).item()
+                        # writer.add_scalar(f'GradNorm/{name}', grad_norm, epoch * args.steps_per_epoch + step)
 
             epoch_loss.append(loss_list)
             epoch_total_loss.append(loss.item())
             epoch_step_time.append(time.time() - step_start_time)
-
+        print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
         # print epoch info
         epoch_info = 'Epoch %d/%d' % (epoch + 1, args.epochs)
         time_info = '%.4f sec/step' % np.mean(epoch_step_time)
@@ -565,23 +599,23 @@ def main():
         loss_info = 'loss: %.4e  (%s)%s' % (np.mean(epoch_total_loss), losses_info, additional_info)
         print(' - '.join((epoch_info, time_info, loss_info)), flush=True)
 
-        writer.add_scalar('Loss/Total', np.mean(epoch_total_loss), epoch)
-        for i, name in enumerate(loss_names):
-            writer.add_scalar(f'Loss/{name}', np.mean(epoch_loss, axis=0)[i], epoch)
+        # writer.add_scalar('Loss/Total', np.mean(epoch_total_loss), epoch)
+        # for i, name in enumerate(loss_names):
+        #     writer.add_scalar(f'Loss/{name}', np.mean(epoch_loss, axis=0)[i], epoch)
 
-        if args.use_mi:
-            writer.add_scalar('Loss/MutualInformation', np.mean(epoch_mi_loss), epoch)
-        if args.use_bending:
-            writer.add_scalar('Loss/BendingEnergy', np.mean(epoch_bend_loss), epoch)
-        if args.use_ic:
-            writer.add_scalar('Loss/InverseConsistency', np.mean(epoch_ic_loss), epoch)
+        # if args.use_mi:
+        #     writer.add_scalar('Loss/MutualInformation', np.mean(epoch_mi_loss), epoch)
+        # if args.use_bending:
+        #     writer.add_scalar('Loss/BendingEnergy', np.mean(epoch_bend_loss), epoch)
+        # if args.use_ic:
+        #     writer.add_scalar('Loss/InverseConsistency', np.mean(epoch_ic_loss), epoch)
 
 
     # final model save
     final_time_str = datetime.now().strftime('%m-%d-%H-%M')
     final_filename = f"{final_time_str}-ep#{args.epochs}.pt"
     model.save(os.path.join(model_dir, final_filename))
-    writer.close() 
+    # writer.close() 
 
 
 if __name__ == '__main__':
