@@ -46,95 +46,110 @@ from torch.utils.tensorboard import SummaryWriter
 # import voxelmorph with pytorch backend
 os.environ['NEURITE_BACKEND'] = 'pytorch'
 os.environ['VXM_BACKEND'] = 'pytorch'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 import voxelmorph as vxm  # nopep8
 import re
 from collections import defaultdict
 
-import re
-from collections import defaultdict
+torch.backends.cudnn.deterministic = False
+torch.backends.cudnn.benchmark     = True
 
 class ScanToScanDataset(Dataset):
-    def __init__(self, image_paths, seg_paths=None, use_segs=False,
-                 add_feat_axis=True, bidir=False, group_by_patient=False):
-        self.image_paths = image_paths
-        self.seg_paths = seg_paths
-        self.use_segs = use_segs
+    """
+    Dataset that returns pairs of scans from the same patient and same MR sequence.
+    Groups images by (patient_id, MR_sequence_id) and samples two distinct scans from each group.
+    Shuffle_pairs controls random vs. deterministic pairing.
+    """
+    def __init__(self,
+                 image_paths,
+                 seg_paths=None,
+                 use_segs=False,
+                 add_feat_axis=True,
+                 bidir=False,
+                 shuffle_pairs=True):
+        assert isinstance(image_paths, list) and len(image_paths) > 0, \
+            "image_paths must be a non-empty list"
+        if use_segs:
+            assert seg_paths is not None and len(seg_paths) == len(image_paths), \
+                "seg_paths must be provided and match image_paths length when use_segs=True"
+
+        self.image_paths   = image_paths
+        self.seg_paths     = seg_paths
+        self.use_segs      = use_segs
         self.add_feat_axis = add_feat_axis
-        self.bidir = bidir
-        self.group_by_patient = group_by_patient
+        self.bidir         = bidir
+        self.shuffle_pairs = shuffle_pairs
 
-        if self.group_by_patient:
-            self.patient_to_images = defaultdict(list)
-            self.patient_to_segs = defaultdict(list) if use_segs else None
+        # Build groups by (patient_id, MR_sequence)
+        self.grp_to_images = defaultdict(list)
+        self.grp_to_segs   = defaultdict(list) if use_segs else None
 
-            for i, path in enumerate(image_paths):
-                pid = self._extract_patient_id(path)
-                self.patient_to_images[pid].append(path)
-                if use_segs:
-                    self.patient_to_segs[pid].append(seg_paths[i])
+        for i, path in enumerate(self.image_paths):
+            pid = self._extract_patient_id(path)
+            seq = self._extract_sequence_id(path)
+            key = (pid, seq)
+            self.grp_to_images[key].append(path)
+            if use_segs:
+                self.grp_to_segs[key].append(self.seg_paths[i])
 
-            self.patient_ids = list(self.patient_to_images.keys())
+        # Only keep groups with ≥2 scans
+        self.valid_keys = [k for k, imgs in self.grp_to_images.items() if len(imgs) > 1]
+        assert self.valid_keys, "No patient/sequence groups with ≥2 scans found."
 
     def _extract_patient_id(self, path):
         match = re.search(r'pt\d+', path)
-        if match:
-            return match.group()
-        raise ValueError(f"Could not extract patient ID from path: {path}")
+        assert match, f"Could not extract patient ID from path: {path}"
+        return match.group()
+
+    def _extract_sequence_id(self, path):
+        match = re.search(r'MR(\d+)', path)
+        assert match, f"Could not extract MR sequence ID from path: {path}"
+        return match.group(1)
 
     def __len__(self):
-        if self.group_by_patient:
-            return sum(len(paths) for paths in self.patient_to_images.values())
-        return len(self.image_paths)
+        total = sum(len(imgs) for imgs in self.grp_to_images.values())
+        assert total > 0, "Dataset has no images"
+        return total
 
     def __getitem__(self, idx):
-        if self.group_by_patient:
-            # Sample from a single patient group
-            pid = random.choice(self.patient_ids)
-            image_group = self.patient_to_images[pid]
-
-            if len(image_group) < 2:
-                raise ValueError(f"Not enough images for patient {pid} to sample a pair.")
-
-            moving_path, fixed_path = random.sample(image_group, 2)
-            if self.use_segs:
-                seg_group = self.patient_to_segs[pid]
-                seg_moving_path, seg_fixed_path = [seg_group[image_group.index(p)] for p in [moving_path, fixed_path]]
+        if self.shuffle_pairs:
+            # random sampling
+            key  = random.choice(self.valid_keys)
+            imgs = self.grp_to_images[key]
+            moving_path, fixed_path = random.sample(imgs, 2)
         else:
-            # Default: sample completely randomly
-            fixed_idx = np.random.randint(0, len(self.image_paths))
-            moving_idx = np.random.randint(0, len(self.image_paths))
-            moving_path = self.image_paths[moving_idx]
-            fixed_path = self.image_paths[fixed_idx]
-            if self.use_segs:
-                seg_moving_path = self.seg_paths[moving_idx]
-                seg_fixed_path = self.seg_paths[fixed_idx]
-
-        # Load image files
-        moving = vxm.py.utils.load_volfile(moving_path, add_batch_axis=False, add_feat_axis=self.add_feat_axis)
-        fixed = vxm.py.utils.load_volfile(fixed_path, add_batch_axis=False, add_feat_axis=self.add_feat_axis)
-
-        inputs = [moving, fixed]
-        outputs = [fixed]
-
-        if self.bidir:
-            outputs.append(moving)
+            # deterministic: cycle through groups by idx, take first two sorted scans
+            key  = self.valid_keys[idx % len(self.valid_keys)]
+            imgs = sorted(self.grp_to_images[key])
+            moving_path, fixed_path = imgs[0], imgs[1]
 
         if self.use_segs:
-            moving_seg = vxm.py.utils.load_volfile(seg_moving_path, add_batch_axis=False, add_feat_axis=True)
-            fixed_seg = vxm.py.utils.load_volfile(seg_fixed_path, add_batch_axis=False, add_feat_axis=True)
+            segs = self.grp_to_segs[key]
+            seg_moving = segs[imgs.index(moving_path)]
+            seg_fixed  = segs[imgs.index(fixed_path)]
 
-            inputs.append(moving_seg)
-            outputs.append(fixed_seg)
+        # Load volumes
+        moving = vxm.py.utils.load_volfile(
+            moving_path, add_batch_axis=False, add_feat_axis=self.add_feat_axis)
+        fixed = vxm.py.utils.load_volfile(
+            fixed_path,  add_batch_axis=False, add_feat_axis=self.add_feat_axis)
+
+        # (rest of loading, checks, tensor conversion, identical to before…)
+        inputs = [moving, fixed]
+        outputs = [fixed]
+        if self.bidir:
+            outputs.append(moving)
+        if self.use_segs:
+            mseg = vxm.py.utils.load_volfile(seg_moving, add_batch_axis=False, add_feat_axis=True)
+            fseg = vxm.py.utils.load_volfile(seg_fixed,  add_batch_axis=False, add_feat_axis=True)
+            inputs.extend([mseg])
+            outputs.extend([fseg])
             if self.bidir:
-                outputs.append(moving_seg)
+                outputs.append(mseg)
 
-        inputs = [torch.from_numpy(x).float().permute(3, 0, 1, 2) for x in inputs]
-        outputs = [torch.from_numpy(x).float().permute(3, 0, 1, 2) for x in outputs]
-
+        inputs = [torch.from_numpy(x).float().permute(3,0,1,2) for x in inputs]
+        outputs = [torch.from_numpy(x).float().permute(3,0,1,2) for x in outputs]
         return inputs, outputs
-
-
-
 
 
 class ScanToAtlasDataset(Dataset):
@@ -160,6 +175,30 @@ class ScanToAtlasDataset(Dataset):
 
         return [torch.from_numpy(x).float().permute(3, 0, 1, 2) for x in inputs], \
                [torch.from_numpy(x).float().permute(3, 0, 1, 2) for x in outputs]
+
+def format_params(args):
+    components = []
+
+    if args.epochs != 1000:
+        components.append(f"ep{args.epochs}")
+    if args.batch_size != 1:
+        components.append(f"bs{args.batch_size}")
+    if args.lr != 1e-4:
+        components.append(f"lr{args.lr:.0e}")
+    if args.image_loss != 'mse':
+        components.append(args.image_loss)
+    if args.bidir:
+        components.append("bidir")
+    if args.use_seg:
+        components.append("seg")
+    if args.use_mi:
+        components.append("mi")
+    if args.use_bending:
+        components.append("bend")
+    if args.use_ic:
+        components.append("ic")
+
+    return "_".join(components)
 
 
 def main():
@@ -229,8 +268,15 @@ def main():
                         help='weight for segmentation-based loss (default: 0.5)')
     parser.add_argument('--shuffle', action='store_true',
                     help='Only sample image pairs from the same patient (default: False)')
+    parser.add_argument(
+        '--no-shuffle-pairs', dest='shuffle_pairs', action='store_false',
+        help='Disable random sampling of scan-pairs (use deterministic ordering)')
+    parser.set_defaults(shuffle_pairs=True)
 
     args = parser.parse_args()
+    assert args.batch_size > 0, "batch-size must be > 0"
+    assert args.epochs > 0, "epochs must be > 0"
+    assert args.lr > 0, "learning rate must be > 0"
 
     bidir = args.bidir
 
@@ -270,12 +316,12 @@ def main():
             use_segs=args.use_seg,
             add_feat_axis=not args.multichannel,
             bidir=args.bidir,
-            group_by_patient=args.shuffle
+            shuffle_pairs=args.shuffle_pairs
         )
 
-
-
-    generator = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    generator = torch.utils.data.DataLoader(
+        dataset, batch_size=args.batch_size, shuffle=False,
+        num_workers=4, pin_memory=True)
 
     # extract shape from sampled input
     sample_input, _ = next(iter(generator))  # One batch
@@ -331,16 +377,27 @@ def main():
         model.save = model.module.save
 
     # prepare the model for training and send to device
+    conv3d_modules = (model.modules() if not isinstance(model, torch.nn.DataParallel)
+                  else model.module.modules())
+    for m in conv3d_modules:
+        # Voxelmorph’s final 3‐channel Conv3d predicts the displacement field
+        if isinstance(m, torch.nn.Conv3d) and m.out_channels == 3:
+            torch.nn.init.zeros_(m.weight)
+            if m.bias is not None:
+                torch.nn.init.zeros_(m.bias)
+
     model.to(device)
     model.train()
     from datetime import datetime
 
     # Custom base log directory
-    log_base = r"C:\Users\P096350\OneDrive - Amsterdam UMC\Bureaublad\logs"
+    log_base = r"C:\Users\P096350\Documents\logs"
 
     # Timestamp for unique run folders
-    timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    log_dir = os.path.join(log_base, timestamp)
+    param_str = format_params(args)
+    timestamp = datetime.now().strftime('%m-%d_%H-%M')
+    run_name = f"{timestamp}_{param_str}"
+    log_dir = os.path.join(log_base, run_name)
 
     # Create writer
     writer = SummaryWriter(log_dir=log_dir)
@@ -397,12 +454,10 @@ def main():
 
     # training loops
     for epoch in range(args.initial_epoch, args.epochs):
-        writer.add_scalar("Training/Epoch", epoch, epoch)
 
         # save model checkpoint
         if epoch % 20 == 0:
-            time_str = datetime.now().strftime('%m-%d-%H-%M')
-            filename = f"{time_str}-ep{epoch}.pt"
+            filename = f"{run_name}-ep{epoch}.pt"
             model.save(os.path.join(model_dir, filename))
 
         epoch_loss = []
@@ -431,76 +486,115 @@ def main():
 
             # forward
             y_pred = model(*inputs)
+            assert isinstance(y_pred, (list, tuple)), "Model output must be list/tuple"
+            if args.bidir:
+                expected = 4
+                names = ["warped_fwd", "flow_fwd", "warped_bwd", "flow_bwd"]
+            else:
+                expected = 2
+                names = ["warped", "flow"]
+
+            assert len(y_pred) == expected, (
+                f"Expected {expected} outputs ({', '.join(names)}), got {len(y_pred)}"
+            )
+
+            def normalize_flow(flow, shape):
+                # flow: (B, 3, D, H, W), shape=(D,H,W)
+                D,H,W = shape
+                scale = torch.tensor([W-1, H-1, D-1], device=flow.device)[None,:,None,None,None]
+                return flow / (scale * 0.5)
+
+            # assume y_pred = [warped_fwd, flow_fwd, warped_bwd, flow_bwd]
+            if bidir:
+                assert len(y_pred) == 4, f"Expected 4 outputs in bidir mode, got {len(y_pred)}"
+                warped_fwd, flow_fwd_raw, warped_bwd, flow_bwd_raw = y_pred
+
+                flow_fwd = normalize_flow(flow_fwd_raw, inputs[0].shape[2:])
+                flow_bwd = normalize_flow(flow_bwd_raw, inputs[0].shape[2:])
+                y_pred = [warped_fwd, flow_fwd, warped_bwd, flow_bwd]
+
+            else:
+                assert len(y_pred) == 2, f"Expected 2 outputs in unidir mode, got {len(y_pred)}"
+                warped, flow_raw = y_pred
+                flow = normalize_flow(flow_raw, inputs[0].shape[2:])
+                y_pred = [warped, flow]
+
 
             # Determine bidirectional mode based on output length
-            is_bidir = len(y_pred) == 4
+            # is_bidir = len(y_pred) == 4
 
-            # Extract flows
-            if is_bidir:
-                flow_fwd = y_pred[2]
-                flow_bwd = y_pred[3]
-            else:
-                flow_fwd = y_pred[1]
-                flow_bwd = None  # not available
+            # # Extract flows
+            # if is_bidir:
+            #     flow_fwd = y_pred[2]
+            #     flow_bwd = y_pred[3]
+            # else:
+            #     flow_fwd = y_pred[1]
+            #     flow_bwd = None  # not available
 
-            # Log flow magnitude histograms
-            writer.add_histogram('flow_fwd/magnitude', torch.norm(flow_fwd, dim=1), epoch * args.steps_per_epoch + step)
-            if flow_bwd is not None:
-                writer.add_histogram('flow_bwd/magnitude', torch.norm(flow_bwd, dim=1), epoch * args.steps_per_epoch + step)
+            # # Log flow magnitude histograms
+            # writer.add_histogram('flow_fwd/magnitude', torch.norm(flow_fwd, dim=1), epoch * args.steps_per_epoch + step)
+            # if flow_bwd is not None:
+            #     writer.add_histogram('flow_bwd/magnitude', torch.norm(flow_bwd, dim=1), epoch * args.steps_per_epoch + step)
 
             # Compute and log Jacobian determinants
-            import torch.nn.functional as F
+            # import torch.nn.functional as F
 
-            def compute_jacobian_determinant(flow):
-                """
-                Compute the Jacobian determinant of a displacement field using finite differences.
-                Assumes input shape: (B, 3, D, H, W)
-                """
-                # Compute gradients along each axis
-                dx = flow[:, :, 1:, :-1, :-1] - flow[:, :, :-1, :-1, :-1]
-                dy = flow[:, :, :-1, 1:, :-1] - flow[:, :, :-1, :-1, :-1]
-                dz = flow[:, :, :-1, :-1, 1:] - flow[:, :, :-1, :-1, :-1]
+            # def compute_jacobian_determinant(flow):
+            #     """
+            #     Compute the Jacobian determinant of a displacement field using finite differences.
+            #     Assumes input shape: (B, 3, D, H, W)
+            #     """
+            #     # Compute gradients along each axis
+            #     dx = flow[:, :, 1:, :-1, :-1] - flow[:, :, :-1, :-1, :-1]
+            #     dy = flow[:, :, :-1, 1:, :-1] - flow[:, :, :-1, :-1, :-1]
+            #     dz = flow[:, :, :-1, :-1, 1:] - flow[:, :, :-1, :-1, :-1]
 
-                # Construct Jacobian matrix J with shape (B, D-1, H-1, W-1, 3, 3)
-                J = torch.stack((dx, dy, dz), dim=-1)  # (B, 3, D-1, H-1, W-1, 3)
-                J = J.permute(0, 2, 3, 4, 1, 5)        # -> (B, D-1, H-1, W-1, 3, 3)
+            #     # Construct Jacobian matrix J with shape (B, D-1, H-1, W-1, 3, 3)
+            #     J = torch.stack((dx, dy, dz), dim=-1)  # (B, 3, D-1, H-1, W-1, 3)
+            #     J = J.permute(0, 2, 3, 4, 1, 5)        # -> (B, D-1, H-1, W-1, 3, 3)
 
-                # Compute the determinant of J
-                jac_det = torch.linalg.det(J)         # (B, D-1, H-1, W-1)
+            #     # Compute the determinant of J
+            #     jac_det = torch.linalg.det(J)         # (B, D-1, H-1, W-1)
 
-                return jac_det
+            #     return jac_det
 
 
-            jac_fwd = compute_jacobian_determinant(flow_fwd)
-            writer.add_histogram('jacobian_fwd/values', jac_fwd, epoch * args.steps_per_epoch + step)
-            writer.add_scalar('jacobian_fwd/folding_ratio', (jac_fwd < 0).float().mean().item(), epoch * args.steps_per_epoch + step)
+            # jac_fwd = compute_jacobian_determinant(flow_fwd)
+            # writer.add_histogram('jacobian_fwd/values', jac_fwd, epoch * args.steps_per_epoch + step)
+            # writer.add_scalar('jacobian_fwd/folding_ratio', (jac_fwd < 0).float().mean().item(), epoch * args.steps_per_epoch + step)
 
-            if flow_bwd is not None:
-                jac_bwd = compute_jacobian_determinant(flow_bwd)
-                writer.add_histogram('jacobian_bwd/values', jac_bwd, epoch * args.steps_per_epoch + step)
-                writer.add_scalar('jacobian_bwd/folding_ratio', (jac_bwd < 0).float().mean().item(), epoch * args.steps_per_epoch + step)
+            # if flow_bwd is not None:
+            #     jac_bwd = compute_jacobian_determinant(flow_bwd)
+            #     writer.add_histogram('jacobian_bwd/values', jac_bwd, epoch * args.steps_per_epoch + step)
+            #     writer.add_scalar('jacobian_bwd/folding_ratio', (jac_bwd < 0).float().mean().item(), epoch * args.steps_per_epoch + step)
 
 
             # compute loss
             loss = 0
             loss_list = []
-            # image losses (bidir-aware)
+            # image loss forward
             curr_loss = losses[0](y_true[0], y_pred[0]) * weights[0]
             loss_list.append(curr_loss.item())
             loss += curr_loss
 
-            curr_loss = losses[1](y_true[1], y_pred[1]) * weights[1]
-            loss_list.append(curr_loss.item())
-            loss += curr_loss
+            # image loss backward (only if bidir is enabled)
+            if bidir:
+                curr_loss = losses[1](y_true[1], y_pred[1]) * weights[1]
+                loss_list.append(curr_loss.item())
+                loss += curr_loss
+
 
             # deformation loss (only uses flow field)
-            curr_loss = losses[2](None, y_pred[2]) * weights[2]
+            grad_idx = 2 if bidir else 1  # because in unidir: y_pred = [warped, flow]
+            curr_loss = losses[grad_idx](None, y_pred[grad_idx]) * weights[grad_idx]
             loss_list.append(curr_loss.item())
             loss += curr_loss
 
             # inverse consistency loss
             if args.use_ic and bidir:
-                loss_ic = inv_consistency_loss(y_pred[2], y_pred[3])
+                raw_ic = inv_consistency_loss(y_pred[2], y_pred[3])        # sum over voxels
+                num_voxels = torch.tensor(y_pred[2].numel(), device=raw_ic.device)
+                loss_ic = raw_ic / num_voxels                               # now an average per-voxel
                 loss += args.lambda_ic * loss_ic
                 epoch_ic_loss.append(loss_ic.item())
 
@@ -522,23 +616,14 @@ def main():
                 writer.add_image('fixed', inputs[1][0, 0, :, :, mid_slice], epoch, dataformats='HW')
                 writer.add_image('warped', y_pred[0][0, 0, :, :, mid_slice], epoch, dataformats='HW')
 
+            assert not torch.isnan(loss), "Loss is NaN"
+
             # backprop
             optimizer.zero_grad()
             loss.backward()
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)
-                    total_norm += param_norm.item() ** 2
-                    if torch.isnan(p.grad).any() or torch.isinf(p.grad).any():
-                        raise ValueError("NaN or Inf detected in gradients!")
-            total_norm = total_norm ** 0.5
-            writer.add_scalar('Gradient/global_norm', total_norm, epoch * args.steps_per_epoch + step)
 
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    grad_norm = param.grad.data.norm(2).item()
-                    writer.add_scalar(f'GradNorm/{name}', grad_norm, epoch * args.steps_per_epoch + step)
+            # Clip gradients to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
             optimizer.step()
 
@@ -578,8 +663,7 @@ def main():
 
 
     # final model save
-    final_time_str = datetime.now().strftime('%m-%d-%H-%M')
-    final_filename = f"{final_time_str}-ep#{args.epochs}.pt"
+    final_filename = f"{run_name}_final.pt"
     model.save(os.path.join(model_dir, final_filename))
     writer.close() 
 
