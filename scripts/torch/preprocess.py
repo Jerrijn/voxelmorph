@@ -13,7 +13,6 @@ Usage:
 import os
 import argparse
 import numpy as np
-import voxelmorph as vxm
 import nibabel as nib
 
 
@@ -102,6 +101,9 @@ def main():
 
     # Walk through the input directory recursively.
     for root, dirs, files in os.walk(args.input_dir):
+        if 'DVF' in root:
+            print(f"Skipping folder with DVF: {root}")
+            continue
         for file in files:
             if file.endswith('.nii') or file.endswith('.nii.gz'):
                 file_path = os.path.join(root, file)

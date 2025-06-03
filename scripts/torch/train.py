@@ -112,43 +112,57 @@ class ScanToScanDataset(Dataset):
         return total
 
     def __getitem__(self, idx):
+        # 1) pick a pair of scans (moving/fixed)
         if self.shuffle_pairs:
-            # random sampling
             key  = random.choice(self.valid_keys)
             imgs = self.grp_to_images[key]
             moving_path, fixed_path = random.sample(imgs, 2)
         else:
-            # deterministic: cycle through groups by idx, take first two sorted scans
             key  = self.valid_keys[idx % len(self.valid_keys)]
             imgs = sorted(self.grp_to_images[key])
             moving_path, fixed_path = imgs[0], imgs[1]
 
+        # 2) if using segs, pick the corresponding seg files
         if self.use_segs:
             segs = self.grp_to_segs[key]
             seg_moving = segs[imgs.index(moving_path)]
             seg_fixed  = segs[imgs.index(fixed_path)]
 
-        # Load volumes
+        # 3) load volumes (intensity)  
         moving = vxm.py.utils.load_volfile(
             moving_path, add_batch_axis=False, add_feat_axis=self.add_feat_axis)
-        fixed = vxm.py.utils.load_volfile(
+        fixed  = vxm.py.utils.load_volfile(
             fixed_path,  add_batch_axis=False, add_feat_axis=self.add_feat_axis)
 
-        # (rest of loading, checks, tensor conversion, identical to before…)
-        inputs = [moving, fixed]
+        # 4) load segmentation masks and build weight masks
+        if self.use_segs:
+            # assume seg maps are binary (0/1); threshold at 0.5 if probabilistic
+            mseg = vxm.py.utils.load_volfile(
+                seg_moving, add_batch_axis=False, add_feat_axis=True)
+            fseg = vxm.py.utils.load_volfile(
+                seg_fixed,  add_batch_axis=False, add_feat_axis=True)
+
+            mseg_bin = (mseg > 0.5).astype(np.float32)  # bowel region = 1
+            fseg_bin = (fseg > 0.5).astype(np.float32)
+
+            # weight = 1.0 inside bowel, 0.1 outside
+            w_moving = mseg_bin * 1.0 + (1.0 - mseg_bin) * 0.25
+            w_fixed  = fseg_bin * 1.0 + (1.0 - fseg_bin) * 0.25
+
+            # apply weight mask to intensities
+            moving = moving * w_moving
+            fixed  = fixed  * w_fixed
+
+        # 5) build inputs/outputs lists as before
+        inputs  = [moving, fixed]
         outputs = [fixed]
         if self.bidir:
             outputs.append(moving)
-        if self.use_segs:
-            mseg = vxm.py.utils.load_volfile(seg_moving, add_batch_axis=False, add_feat_axis=True)
-            fseg = vxm.py.utils.load_volfile(seg_fixed,  add_batch_axis=False, add_feat_axis=True)
-            inputs.extend([mseg])
-            outputs.extend([fseg])
-            if self.bidir:
-                outputs.append(mseg)
 
-        inputs = [torch.from_numpy(x).float().permute(3,0,1,2) for x in inputs]
+        # 6) convert to torch.Tensor with channel-first ordering
+        inputs  = [torch.from_numpy(x).float().permute(3,0,1,2) for x in inputs]
         outputs = [torch.from_numpy(x).float().permute(3,0,1,2) for x in outputs]
+
         return inputs, outputs
 
 
@@ -200,6 +214,17 @@ def format_params(args):
 
     return "_".join(components)
 
+def flow_stats(flow):
+    """
+    flow : tensor (B, 3, D, H, W)  – raw flow in voxel units
+    returns dict with mean, rms, p95, max over the whole batch
+    """
+    mag = torch.linalg.norm(flow, dim=1)             # (B, D, H, W)
+    mean = mag.mean().item()
+    rms  = torch.sqrt((mag ** 2).mean()).item()
+    p95  = torch.quantile(mag, 0.95).item()
+    vmax = mag.max().item()
+    return dict(mean=mean, rms=rms, p95=p95, vmax=vmax)
 
 def main():
     # parse the commandline
@@ -350,26 +375,13 @@ def main():
         # load initial model (if specified)
         model = vxm.networks.VxmDense.load(args.load_model, device)
     else:
-        # otherwise configure new model
-        if args.use_seg:
-            # Create a model that accepts segmentation maps as additional input
-            model = vxm.networks.VxmDenseSegmentation(
-                inshape=inshape,
-                nb_unet_features=[enc_nf, dec_nf],
-                bidir=True,
-                int_steps=args.int_steps,
-                int_downsize=args.int_downsize,
-                seg_weight=args.seg_weight
-            )
-        else:
-            # Standard model without segmentation
-            model = vxm.networks.VxmDense(
-                inshape=inshape,
-                nb_unet_features=[enc_nf, dec_nf],
-                bidir=bidir,
-                int_steps=args.int_steps,
-                int_downsize=args.int_downsize
-            )
+        model = vxm.networks.VxmDense(
+            inshape=inshape,
+            nb_unet_features=[enc_nf, dec_nf],
+            bidir=bidir,
+            int_steps=args.int_steps,
+            int_downsize=args.int_downsize
+        )
 
     if nb_gpus > 1:
         # use multiple GPUs via DataParallel
@@ -431,7 +443,7 @@ def main():
     if bidir:
         loss_names = ['image_loss_fwd', 'image_loss_bwd']
     loss_names += ['grad_loss']
-    if args.use_seg:
+    if args.use_seg and False:
         loss_names += ['dice_loss']
 
     # Define loss weights from command line arguments
@@ -446,7 +458,7 @@ def main():
 
 
     # Add to the losses section
-    if args.use_seg:
+    if args.use_seg and False:
         # Add Dice loss for segmentation maps
         dice_loss = vxm.losses.Dice().loss
         losses += [dice_loss]
@@ -462,6 +474,7 @@ def main():
 
         epoch_loss = []
         epoch_total_loss = []
+        epoch_flow = [] 
         epoch_step_time = []
         
         # Add tracking for additional losses
@@ -509,15 +522,17 @@ def main():
                 assert len(y_pred) == 4, f"Expected 4 outputs in bidir mode, got {len(y_pred)}"
                 warped_fwd, flow_fwd_raw, warped_bwd, flow_bwd_raw = y_pred
 
-                flow_fwd = normalize_flow(flow_fwd_raw, inputs[0].shape[2:])
+                flow = normalize_flow(flow_fwd_raw, inputs[0].shape[2:])
                 flow_bwd = normalize_flow(flow_bwd_raw, inputs[0].shape[2:])
-                y_pred = [warped_fwd, flow_fwd, warped_bwd, flow_bwd]
+                y_pred = [warped_fwd, flow, warped_bwd, flow_bwd]
 
             else:
                 assert len(y_pred) == 2, f"Expected 2 outputs in unidir mode, got {len(y_pred)}"
                 warped, flow_raw = y_pred
                 flow = normalize_flow(flow_raw, inputs[0].shape[2:])
                 y_pred = [warped, flow]
+            
+            epoch_flow.append(flow_stats(flow))
 
 
             # Determine bidirectional mode based on output length
@@ -631,6 +646,10 @@ def main():
             epoch_total_loss.append(loss.item())
             epoch_step_time.append(time.time() - step_start_time)
 
+        flow_mean = np.mean([d['mean'] for d in epoch_flow])
+        flow_rms  = np.mean([d['rms']  for d in epoch_flow])
+        flow_p95  = np.mean([d['p95']  for d in epoch_flow])
+        flow_max  = np.max( [d['vmax'] for d in epoch_flow])
         # print epoch info
         epoch_info = 'Epoch %d/%d' % (epoch + 1, args.epochs)
         time_info = '%.4f sec/step' % np.mean(epoch_step_time)
@@ -648,9 +667,17 @@ def main():
             additional_info = '  Additional losses: ' + ', '.join(additional_losses)
         
         loss_info = 'loss: %.4e  (%s)%s' % (np.mean(epoch_total_loss), losses_info, additional_info)
-        print(' - '.join((epoch_info, time_info, loss_info)), flush=True)
+        metric_info = (f"  ⟨|v|⟩={flow_mean:.3f}"
+                   f"  RMS={flow_rms:.3f}"
+                   f"  P95={flow_p95:.3f}"
+                   f"  max={flow_max:.3f}")
+        print(' - '.join((epoch_info, time_info, loss_info, metric_info)), flush=True)
 
         writer.add_scalar('Loss/Total', np.mean(epoch_total_loss), epoch)
+        writer.add_scalar('DVF/Mean', flow_mean, epoch)
+        writer.add_scalar('DVF/RMS',  flow_rms,  epoch)
+        writer.add_scalar('DVF/P95',  flow_p95,  epoch)
+        writer.add_scalar('DVF/Max',  flow_max,  epoch)
         for i, name in enumerate(loss_names):
             writer.add_scalar(f'Loss/{name}', np.mean(epoch_loss, axis=0)[i], epoch)
 
@@ -660,6 +687,7 @@ def main():
             writer.add_scalar('Loss/BendingEnergy', np.mean(epoch_bend_loss), epoch)
         if args.use_ic:
             writer.add_scalar('Loss/InverseConsistency', np.mean(epoch_ic_loss), epoch)
+            
 
 
     # final model save
