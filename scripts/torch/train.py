@@ -51,15 +51,17 @@ import voxelmorph as vxm  # nopep8
 import re
 from collections import defaultdict
 
+from losses import MSE, NCC
+
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark     = True
 
 class ScanToScanDataset(Dataset):
     """
-    Dataset that returns pairs of scans from the same patient and same MR sequence.
-    Groups images by (patient_id, MR_sequence_id) and samples two distinct scans from each group.
-    Shuffle_pairs controls random vs. deterministic pairing.
+    Dataset that returns pairs of scans from the same patient and same MR sequence,
+    plus optional segmentation‐derived weight masks.
     """
+
     def __init__(self,
                  image_paths,
                  seg_paths=None,
@@ -136,22 +138,24 @@ class ScanToScanDataset(Dataset):
 
         # 4) load segmentation masks and build weight masks
         if self.use_segs:
-            # assume seg maps are binary (0/1); threshold at 0.5 if probabilistic
+            # Assume seg maps are binary already, threshold at 0.5
             mseg = vxm.py.utils.load_volfile(
                 seg_moving, add_batch_axis=False, add_feat_axis=True)
             fseg = vxm.py.utils.load_volfile(
                 seg_fixed,  add_batch_axis=False, add_feat_axis=True)
 
-            mseg_bin = (mseg > 0.5).astype(np.float32)  # bowel region = 1
+            # Binarize: voxel value >0.5 → 1.0
+            mseg_bin = (mseg > 0.5).astype(np.float32)
             fseg_bin = (fseg > 0.5).astype(np.float32)
 
-            # weight = 1.0 inside bowel, 0.1 outside
-            w_moving = mseg_bin * 1.0 + (1.0 - mseg_bin) * 0.25
-            w_fixed  = fseg_bin * 1.0 + (1.0 - fseg_bin) * 0.25
+            # Build weight: 1.0 inside segmentation, 0.1 outside
+            w_moving = mseg_bin * 1.0 + (1.0 - mseg_bin) * 0.1  # shape: (H,W,D,1)
+            w_fixed  = fseg_bin * 1.0 + (1.0 - fseg_bin) * 0.1  # shape: (H,W,D,1)
 
-            # apply weight mask to intensities
-            moving = moving * w_moving
-            fixed  = fixed  * w_fixed
+            # Now convert to torch.Tensor with channel‐first ordering
+            # We want shape (1, D, H, W) for each mask
+            w_moving = torch.from_numpy(w_moving).float().permute(3, 0, 1, 2)
+            w_fixed  = torch.from_numpy(w_fixed).float().permute(3, 0, 1, 2)
 
         # 5) build inputs/outputs lists as before
         inputs  = [moving, fixed]
@@ -159,10 +163,20 @@ class ScanToScanDataset(Dataset):
         if self.bidir:
             outputs.append(moving)
 
-        # 6) convert to torch.Tensor with channel-first ordering
-        inputs  = [torch.from_numpy(x).float().permute(3,0,1,2) for x in inputs]
-        outputs = [torch.from_numpy(x).float().permute(3,0,1,2) for x in outputs]
+        # 6) convert intensity volumes to torch.Tensor with channel‐first
+        inputs  = [torch.from_numpy(x).float().permute(3, 0, 1, 2) for x in inputs]
+        outputs = [torch.from_numpy(x).float().permute(3, 0, 1, 2) for x in outputs]
 
+        if self.use_segs:
+            # Return the two images (moving/fixed), the target(s), and weight masks
+            # For unidirectional, masks = [w_fixed]; for bidir, masks = [w_fixed, w_moving]
+            if self.bidir:
+                weights = [w_fixed, w_moving]
+            else:
+                weights = [w_fixed]
+            return inputs, outputs, weights
+
+        # If not using segmentation, just return inputs and outputs
         return inputs, outputs
 
 
@@ -349,8 +363,13 @@ def main():
         num_workers=4, pin_memory=True)
 
     # extract shape from sampled input
-    sample_input, _ = next(iter(generator))  # One batch
-    inshape = sample_input[0].shape[2:] 
+    batch0 = next(iter(generator))
+    if args.use_seg:
+        sample_input, _, _ = batch0
+    else:
+        sample_input, _ = batch0
+    inshape = sample_input[0].shape[2:]
+
 
     # prepare model folder
     model_dir = args.model_dir
@@ -420,9 +439,9 @@ def main():
 
     # prepare image loss
     if args.image_loss == 'ncc':
-        image_loss_func = vxm.losses.NCC().loss
+        image_loss_func = NCC().loss
     elif args.image_loss == 'mse':
-        image_loss_func = vxm.losses.MSE().loss
+        image_loss_func = MSE().loss
     else:
         raise ValueError('Image loss should be "mse" or "ncc", but found "%s"' % args.image_loss)
 
@@ -443,7 +462,7 @@ def main():
     if bidir:
         loss_names = ['image_loss_fwd', 'image_loss_bwd']
     loss_names += ['grad_loss']
-    if args.use_seg and False:
+    if args.use_seg:
         loss_names += ['dice_loss']
 
     # Define loss weights from command line arguments
@@ -458,7 +477,7 @@ def main():
 
 
     # Add to the losses section
-    if args.use_seg and False:
+    if args.use_seg:
         # Add Dice loss for segmentation maps
         dice_loss = vxm.losses.Dice().loss
         losses += [dice_loss]
@@ -483,15 +502,24 @@ def main():
         epoch_ic_loss = [] if args.use_ic else None
 
 
-        for step, (inputs, y_true) in enumerate(generator):
+        for step, batch in enumerate(generator):
             if step >= args.steps_per_epoch:
                 break
 
+            if args.use_seg:
+                inputs, y_true, weight_list = batch
+            else:
+                inputs, y_true = batch
+                weight_list = None
             step_start_time = time.time()
 
             # Send to GPU
             inputs = [d.to(device, non_blocking=True) for d in inputs]
             y_true = [d.to(device, non_blocking=True) for d in y_true]
+
+            if args.use_seg:
+                # weight_list[0] = w_fixed, weight_list[1] = w_moving (if bidir)
+                weight_list = [m.to(device, non_blocking=True) for m in weight_list]
 
             # Log image stats for debugging
             # print(f"[{epoch}:{step}] Moving image min/max: {inputs[0].min().item():.4f} / {inputs[0].max().item():.4f}")
@@ -585,35 +613,62 @@ def main():
 
 
             # compute loss
-            loss = 0
+            loss = 0.0
             loss_list = []
-            # image loss forward
-            curr_loss = losses[0](y_true[0], y_pred[0]) * weights[0]
-            loss_list.append(curr_loss.item())
-            loss += curr_loss
 
-            # image loss backward (only if bidir is enabled)
-            if bidir:
-                curr_loss = losses[1](y_true[1], y_pred[1]) * weights[1]
+            # 1) Image‐reconstruction loss (weighted if args.use_seg)
+            if args.use_seg:
+                # w_fixed = weight_list[0], always present if use_seg=True
+                w_fixed = weight_list[0]  # shape = (B,1,D,H,W)
+
+                # FORWARD direction:
+                #   y_true[0] is the “fixed” image; y_pred[0] is warped→fixed
+                if args.image_loss == 'ncc':
+                    curr_loss = losses[0](y_true[0], y_pred[0])
+                else:
+                    curr_loss = losses[0](y_true[0], y_pred[0], w_fixed) * weights[0]
                 loss_list.append(curr_loss.item())
                 loss += curr_loss
 
+                if bidir:
+                    # w_moving = weight_list[1], provided only if bidir & use_seg
+                    w_moving = weight_list[1]  # shape = (B,1,D,H,W)
 
-            # deformation loss (only uses flow field)
-            grad_idx = 2 if bidir else 1  # because in unidir: y_pred = [warped, flow]
-            curr_loss = losses[grad_idx](None, y_pred[grad_idx]) * weights[grad_idx]
+                    # In bidir mode, y_pred = [warped_fwd, flow_fwd, warped_bwd, flow_bwd]
+                    # so the “backward‐to‐moving” warped image is y_pred[2]
+                    curr_loss = losses[1](y_true[1], y_pred[2], w_moving) * weights[1]
+                    loss_list.append(curr_loss.item())
+                    loss += curr_loss
+
+            else:
+                # No segmentation weighting → plain MSE or NCC
+                curr_loss = losses[0](y_true[0], y_pred[0]) * weights[0]
+                loss_list.append(curr_loss.item())
+                loss += curr_loss
+
+                if bidir:
+                    # In bidir mode, y_pred[2] is warped_bwd
+                    curr_loss = losses[1](y_true[1], y_pred[2]) * weights[1]
+                    loss_list.append(curr_loss.item())
+                    loss += curr_loss
+
+            # 2) Deformation gradient‐loss (unchanged)
+            grad_idx = 2 if bidir else 1
+            # If bidir: y_pred[3] is flow_bwd_normed; if unidir: y_pred[1] is flow_normed
+            flow_for_grad = y_pred[grad_idx]
+            curr_loss = losses[grad_idx](None, flow_for_grad) * weights[grad_idx]
             loss_list.append(curr_loss.item())
             loss += curr_loss
 
-            # inverse consistency loss
+            # 3) Inverse‐consistency (if requested)
             if args.use_ic and bidir:
-                raw_ic = inv_consistency_loss(y_pred[2], y_pred[3])        # sum over voxels
+                raw_ic = inv_consistency_loss(y_pred[2], y_pred[3])  # y_pred[2]=warped_bwd, y_pred[3]=flow_bwd
                 num_voxels = torch.tensor(y_pred[2].numel(), device=raw_ic.device)
-                loss_ic = raw_ic / num_voxels                               # now an average per-voxel
+                loss_ic = raw_ic / num_voxels
                 loss += args.lambda_ic * loss_ic
                 epoch_ic_loss.append(loss_ic.item())
 
-            # extra losses
+            # 4) Mutual‐information and bending if requested (unchanged)
             if args.use_mi:
                 loss_mi = mi_loss.loss(y_true[0], y_pred[0])
                 loss += lambda_mi * loss_mi
@@ -678,8 +733,10 @@ def main():
         writer.add_scalar('DVF/RMS',  flow_rms,  epoch)
         writer.add_scalar('DVF/P95',  flow_p95,  epoch)
         writer.add_scalar('DVF/Max',  flow_max,  epoch)
-        for i, name in enumerate(loss_names):
-            writer.add_scalar(f'Loss/{name}', np.mean(epoch_loss, axis=0)[i], epoch)
+        avg_losses = np.mean(epoch_loss, axis=0)
+        for i, name in enumerate(loss_names[:len(avg_losses)]):
+            writer.add_scalar(f'Loss/{name}', avg_losses[i], epoch)
+
 
         if args.use_mi:
             writer.add_scalar('Loss/MutualInformation', np.mean(epoch_mi_loss), epoch)

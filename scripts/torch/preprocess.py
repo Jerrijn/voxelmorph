@@ -1,10 +1,11 @@
 #!/usr/bin/env python
 """
 Preprocess script for medical images.
-- Normalizes intensity values.
+- Normalizes intensity values (only for image data).
 - Resizes images to a common shape.
 - Pads/crops to ensure spatial dimensions are multiples of 16.
-- Saves metadata for postprocessing.
+- Saves metadata for postprocessing (only for image data).
+- Automatically detects DVFs based on filename.
 
 Usage:
     python preprocess.py --input_dir path/to/raw_data --output_dir path/to/preprocessed_data
@@ -18,61 +19,66 @@ import nibabel as nib
 
 def pad_or_crop_volume(vol, factor=16):
     """
-    Pads or crops a 3D volume so that each spatial dimension becomes a multiple of `factor`.
-    
-    Parameters:
-        vol (np.ndarray): 3D volume.
-        factor (int): The factor to which dimensions must be a multiple.
-    
+    Pads or crops a 3D or 4D volume (DVF) so that spatial dims (first 3) are multiples of `factor`.
+
     Returns:
         vol_padded (np.ndarray): The padded/cropped volume.
         original_shape (tuple): The original volume shape.
     """
-    original_shape = np.array(vol.shape)
-    target_shape = np.ceil(original_shape / factor).astype(int) * factor
-    pad_crop = target_shape - original_shape
+    is_dvf = (vol.ndim == 4 and vol.shape[-1] == 3)
+    spatial_shape = np.array(vol.shape[:3])
+    target_shape = np.ceil(spatial_shape / factor).astype(int) * factor
+    pad_crop = target_shape - spatial_shape
 
-    # If cropping is needed (i.e., pad_crop[d] is negative), perform cropping first.
+    # Crop if needed
     cropped = vol
     for d in range(3):
         if pad_crop[d] < 0:
             start = (-pad_crop[d]) // 2
             end = start + target_shape[d]
-            slices = [slice(None)] * 3
+            slices = [slice(None)] * vol.ndim
             slices[d] = slice(start, end)
             cropped = cropped[tuple(slices)]
-    
-    new_shape = np.array(cropped.shape)
+
+    # Pad if needed
+    new_shape = np.array(cropped.shape[:3])
     pad_needed = target_shape - new_shape
     pad_before = pad_needed // 2
     pad_after = pad_needed - pad_before
     pad_width = [(int(pad_before[i]), int(pad_after[i])) for i in range(3)]
-    vol_padded = np.pad(cropped, pad_width, mode='constant', constant_values=0)
-    
-    return vol_padded, original_shape
 
+    # If DVF, don't pad vector dim
+    if is_dvf:
+        pad_width.append((0, 0))  # No padding on last dim
+
+    vol_padded = np.pad(cropped, pad_width, mode='constant', constant_values=0)
+    return vol_padded, spatial_shape
 
 def preprocess_image(file_path, output_dir):
     """
-    Loads, normalizes, and preprocesses an image, then saves the result and metadata.
-    Skips non-3D images.
+    Loads and preprocesses an image (cine-MRI or DVF) and saves the result.
     """
+    basename = os.path.basename(file_path)
+    is_dvf = 'DVF' in basename.upper()
+
     img = nib.load(file_path)
     vol = img.get_fdata()
+    vol = np.squeeze(vol)  # removes dims like (160,160,50,1,3) → (160,160,50,3)
 
-    # Skip non-3D volumes
-    if vol.ndim != 3:
-        print(f"Skipping (non-3D): {file_path} with shape {vol.shape}")
-        return
+    if is_dvf:
+        if vol.ndim != 4 or vol.shape[-1] != 3:
+            print(f"Skipping (unexpected DVF shape): {file_path} with shape {vol.shape}")
+            return
+        vol_padded, _ = pad_or_crop_volume(vol, factor=16)
 
-    # Normalize intensity between 0 and 1
-    vol = (vol - np.min(vol)) / (np.max(vol) - np.min(vol) + 1e-5)
+    else:
+        if vol.ndim != 3:
+            print(f"Skipping (non-3D image): {file_path} with shape {vol.shape}")
+            return
+        vol = (vol - np.min(vol)) / (np.max(vol) - np.min(vol) + 1e-5)
+        vol_padded, original_shape = pad_or_crop_volume(vol, factor=16)
 
-    # Pad/crop to multiples of 16
-    vol_padded, original_shape = pad_or_crop_volume(vol, factor=16)
-
-    # Determine the output file name based on the input file name.
-    basename = os.path.basename(file_path)
+    # Build output name
     if basename.endswith('.nii.gz'):
         out_name = basename.replace('.nii.gz', '_preprocessed.nii.gz')
     elif basename.endswith('.nii'):
@@ -80,17 +86,16 @@ def preprocess_image(file_path, output_dir):
     else:
         out_name = basename + '_preprocessed.nii.gz'
 
-    # Ensure the output directory exists
     os.makedirs(output_dir, exist_ok=True)
     preprocessed_file = os.path.join(output_dir, out_name)
     nib.save(nib.Nifti1Image(vol_padded, img.affine), preprocessed_file)
 
-    # Save metadata for undoing preprocessing
-    metadata_file = preprocessed_file.replace('.nii.gz', '_metadata.npy')
-    np.save(metadata_file, {'original_shape': original_shape, 'affine': img.affine})
+    # Save metadata only if not DVF
+    if not is_dvf:
+        metadata_file = preprocessed_file.replace('.nii.gz', '_metadata.npy')
+        np.save(metadata_file, {'original_shape': original_shape, 'affine': img.affine})
 
-    print(f"Processed: {file_path} -> {preprocessed_file}")
-
+    print(f"Processed ({'DVF' if is_dvf else 'IMG'}): {file_path} -> {preprocessed_file}")
 
 
 def main():
@@ -99,17 +104,11 @@ def main():
     parser.add_argument('--output_dir', required=True, help='Directory to save preprocessed images, preserving folder structure')
     args = parser.parse_args()
 
-    # Walk through the input directory recursively.
-    for root, dirs, files in os.walk(args.input_dir):
-        if 'DVF' in root:
-            print(f"Skipping folder with DVF: {root}")
-            continue
+    for root, _, files in os.walk(args.input_dir):
         for file in files:
             if file.endswith('.nii') or file.endswith('.nii.gz'):
                 file_path = os.path.join(root, file)
-                # Compute the file's relative directory with respect to the input directory.
                 relative_dir = os.path.relpath(root, args.input_dir)
-                # Build the corresponding output directory (preserving subfolder structure)
                 output_subfolder = os.path.join(args.output_dir, relative_dir)
                 preprocess_image(file_path, output_subfolder)
 

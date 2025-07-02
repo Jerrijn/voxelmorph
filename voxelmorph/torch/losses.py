@@ -73,8 +73,28 @@ class MSE:
     Mean squared error loss.
     """
 
-    def loss(self, y_true, y_pred):
-        return torch.mean((y_true - y_pred) ** 2)
+    def loss(self,
+             y_true: torch.Tensor,
+             y_pred: torch.Tensor,
+             weight_mask: torch.Tensor = None) -> torch.Tensor:
+        # y_true, y_pred: (B, C, D, H, W)
+        if weight_mask is None:
+            return torch.mean((y_true - y_pred) ** 2)
+
+        # Weighted MSE numerator: sum_x [ w(x) * (error)^2 ]
+        sq_error = (y_pred - y_true).pow(2)  # shape: (B, C, D, H, W)
+
+        # Ensure weight_mask is broadcastable to sq_error
+        # (we expect weight_mask of shape (B, 1, D, H, W) or (B, C, D, H, W))
+        weighted_sq = sq_error * weight_mask
+
+        # Sum over all voxels and channels
+        numerator = weighted_sq.sum()
+
+        # Sum of weights over all voxels and channels
+        denom = weight_mask.sum()
+        # Add a tiny epsilon so we never divide by zero
+        return numerator / (denom + 1e-6)
 
 
 class Dice:

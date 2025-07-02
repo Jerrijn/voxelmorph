@@ -177,7 +177,7 @@ def cmd_motionmap(args):
 def cmd_dvf_check(args):
     # ---- robust loader (canonical shape: X, Y, Z, 3) ----
     files = [f for f in os.listdir(args.folder)
-         if f.lower().endswith(('.nii', '.nii.gz')) and '_dvf' in f.lower()]
+         if f.lower().endswith(('.nii', '.nii.gz')) and '_warp' in f.lower()]
     if not files:
         raise ValueError(f"No DVF files found in {args.folder}")
 

@@ -73,7 +73,7 @@ def main():
     args = parser.parse_args()
 
     # matches '_F###_Mxxx.nii' (### = digits)
-    dvf_pattern = re.compile(r'_F(\d+)_M\d+\.nii(?:\.gz)?$', re.IGNORECASE)
+    dvf_pattern = re.compile(r'_F(\d+)_M(\d+)\.nii(?:\.gz)?$', re.IGNORECASE)
 
     for dvf_root, _, files in os.walk(args.dvf_folder):
         rel_dir = os.path.relpath(dvf_root, args.dvf_folder)
@@ -90,14 +90,13 @@ def main():
                 print(f"[WARN] Skipping unrecognized DVF name '{fn}'")
                 continue
 
-            fixed_idx = int(m.group(1))
-            padded = f"{fixed_idx:03d}"  # zero-pad to three digits
+            fixed_idx, moving_idx = map(int, m.groups())
+            padded = f"{moving_idx:03d}"  # <-- use moving index to find image
 
             if not os.path.isdir(mri_dir):
                 print(f"[WARN] MRI folder '{mri_dir}' missing; skipping '{fn}'")
                 continue
 
-            # look for MRI ending in _<padded>.nii or .nii.gz
             candidates = [
                 f for f in os.listdir(mri_dir)
                 if f.endswith(f"_{padded}.nii") or f.endswith(f"_{padded}.nii.gz")
@@ -107,11 +106,12 @@ def main():
                 continue
             if len(candidates) > 1:
                 print(f"[WARN] Multiple MRIs end with _{padded} in '{mri_dir}': {candidates}; using first")
-            mri_fname = candidates[0]
 
+            mri_fname = candidates[0]
             dvf_path = os.path.join(dvf_root, fn)
             mri_path = os.path.join(mri_dir, mri_fname)
-            print(f"Applying DVF '{fn}' → MRI '{mri_fname}'")
+            print(f"Applying DVF '{fn}' → moving MRI '{mri_fname}' (→ aligned to fixed F{fixed_idx})")
+
 
             # load DVF & MRI
             dvf_img  = nib.load(dvf_path)
