@@ -51,7 +51,7 @@ import voxelmorph as vxm  # nopep8
 import re
 from collections import defaultdict
 
-from losses import MSE, NCC
+from voxelmorph.torch.losses import MSE, NCC, jac0_loss, SurfaceLoss, compute_signed_distance_map
 
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark     = True
@@ -60,7 +60,7 @@ class ScanToScanDataset(Dataset):
     """
     Dataset that returns pairs of scans from the same patient and same MR sequence,
     plus optional segmentation‐derived weight masks.
-    """
+    """ 
 
     def __init__(self,
                  image_paths,
@@ -123,7 +123,7 @@ class ScanToScanDataset(Dataset):
             key  = self.valid_keys[idx % len(self.valid_keys)]
             imgs = sorted(self.grp_to_images[key])
             moving_path, fixed_path = imgs[0], imgs[1]
-
+        #print(f"[Dataset] idx={idx} | key={key} | moving={os.path.basename(moving_path)} | fixed={os.path.basename(fixed_path)}")
         # 2) if using segs, pick the corresponding seg files
         if self.use_segs:
             segs = self.grp_to_segs[key]
@@ -147,15 +147,17 @@ class ScanToScanDataset(Dataset):
             # Binarize: voxel value >0.5 → 1.0
             mseg_bin = (mseg > 0.5).astype(np.float32)
             fseg_bin = (fseg > 0.5).astype(np.float32)
-
+            
             # Build weight: 1.0 inside segmentation, 0.1 outside
             w_moving = mseg_bin * 1.0 + (1.0 - mseg_bin) * 0.1  # shape: (H,W,D,1)
             w_fixed  = fseg_bin * 1.0 + (1.0 - fseg_bin) * 0.1  # shape: (H,W,D,1)
 
             # Now convert to torch.Tensor with channel‐first ordering
             # We want shape (1, D, H, W) for each mask
-            w_moving = torch.from_numpy(w_moving).float().permute(3, 0, 1, 2)
-            w_fixed  = torch.from_numpy(w_fixed).float().permute(3, 0, 1, 2)
+            mseg_bin = np.transpose(mseg_bin, (3, 0, 1, 2))  # (1, D, H, W)
+            w_moving = torch.from_numpy(mseg_bin).float()
+            fseg_bin = np.transpose(fseg_bin, (3, 0, 1, 2))  # (1, D, H, W)
+            w_fixed = torch.from_numpy(fseg_bin).float()
 
         # 5) build inputs/outputs lists as before
         inputs  = [moving, fixed]
@@ -174,7 +176,7 @@ class ScanToScanDataset(Dataset):
                 weights = [w_fixed, w_moving]
             else:
                 weights = [w_fixed]
-            return inputs, outputs, weights
+            return inputs, outputs, weights, [mseg_bin, fseg_bin]
 
         # If not using segmentation, just return inputs and outputs
         return inputs, outputs
@@ -287,7 +289,7 @@ def main():
     # Add new loss hyperparameters
     parser.add_argument('--use-mi', action='store_true',
                         help='use mutual information loss')
-    parser.add_argument('--lambda-mi', type=float, default=0.1,
+    parser.add_argument('--lambda-mi', type=float, default=0.2,
                         help='weight of mutual information loss (default: 0.1)')
     parser.add_argument('--use-bending', action='store_true',
                         help='use bending energy loss')
@@ -310,7 +312,15 @@ def main():
     parser.add_argument(
         '--no-shuffle-pairs', dest='shuffle_pairs', action='store_false',
         help='Disable random sampling of scan-pairs (use deterministic ordering)')
+    parser.add_argument('--use-jac0', action='store_true', help='Add JAC0 (negative Jacobian) penalty loss')
+    parser.add_argument('--lambda-jac0', type=float, default=0.1, help='Weight for JAC0 loss')
     parser.set_defaults(shuffle_pairs=True)
+
+    parser.add_argument('--use-surface', action='store_true',
+    help='Use surface loss (boundary loss) for segmentation-guided registration')
+    parser.add_argument('--lambda-surface', type=float, default=0.1,
+        help='Weight for surface loss (default: 0.1)')
+
 
     args = parser.parse_args()
     assert args.batch_size > 0, "batch-size must be > 0"
@@ -365,7 +375,7 @@ def main():
     # extract shape from sampled input
     batch0 = next(iter(generator))
     if args.use_seg:
-        sample_input, _, _ = batch0
+        sample_input = batch0[0]
     else:
         sample_input, _ = batch0
     inshape = sample_input[0].shape[2:]
@@ -419,6 +429,12 @@ def main():
 
     model.to(device)
     model.train()
+    if args.use_seg:
+        inshape = next(iter(generator))[0][0].shape[2:]  # (D, H, W)
+        seg_transformer = vxm.layers.SpatialTransformer(inshape, mode='nearest').to(device)
+
+
+
     from datetime import datetime
 
     # Custom base log directory
@@ -482,6 +498,11 @@ def main():
         dice_loss = vxm.losses.Dice().loss
         losses += [dice_loss]
         weights += [args.seg_weight]
+        if args.use_surface:
+            surface_loss = SurfaceLoss()
+            losses += [surface_loss]
+            weights += [args.lambda_surface]
+            loss_names += ['surface_loss']
 
     # training loops
     for epoch in range(args.initial_epoch, args.epochs):
@@ -507,7 +528,10 @@ def main():
                 break
 
             if args.use_seg:
-                inputs, y_true, weight_list = batch
+                inputs, y_true, weight_list, seg_pair = batch
+            
+                moving_seg = seg_pair[0].to(device, non_blocking=True)  # binary
+                fixed_seg  = seg_pair[1].to(device, non_blocking=True)  # binary
             else:
                 inputs, y_true = batch
                 weight_list = None
@@ -622,7 +646,7 @@ def main():
                 w_fixed = weight_list[0]  # shape = (B,1,D,H,W)
 
                 # FORWARD direction:
-                #   y_true[0] is the “fixed” image; y_pred[0] is warped→fixed
+                # y_true[0] is the fixed image; y_pred[0] is warped→fixed
                 if args.image_loss == 'ncc':
                     curr_loss = losses[0](y_true[0], y_pred[0])
                 else:
@@ -632,13 +656,61 @@ def main():
 
                 if bidir:
                     # w_moving = weight_list[1], provided only if bidir & use_seg
-                    w_moving = weight_list[1]  # shape = (B,1,D,H,W)
+                    w_moving = weight_list[1]
 
-                    # In bidir mode, y_pred = [warped_fwd, flow_fwd, warped_bwd, flow_bwd]
-                    # so the “backward‐to‐moving” warped image is y_pred[2]
+                    # y_true[1] is moving image; y_pred[2] is warped←moving
                     curr_loss = losses[1](y_true[1], y_pred[2], w_moving) * weights[1]
                     loss_list.append(curr_loss.item())
                     loss += curr_loss
+
+                # ➕ Segmentation-guided registration using Dice loss
+                if args.seg_weight > 0:
+                    with torch.no_grad():
+                        flow_for_seg = y_pred[1]  # (B, 3, D, H, W)
+                        flow_for_seg = torch.nn.functional.interpolate(
+                            flow_for_seg, size=moving_seg.shape[2:], mode='trilinear', align_corners=True
+                        )
+                        warped_seg = seg_transformer(moving_seg, flow_for_seg)
+                    dice_loss_val = vxm.losses.Dice().loss(fixed_seg, warped_seg) * args.seg_weight
+                    loss += dice_loss_val
+
+                    if 'epoch_dice_loss' not in locals():
+                        epoch_dice_loss = []
+                    epoch_dice_loss.append(dice_loss_val.item())
+                
+                # ➕ Surface Loss (only if enabled)
+                    if args.use_surface:
+                        batch_size = fixed_seg.shape[0]
+                        surface_loss_val = 0.0
+
+                        for i in range(batch_size):
+                            # Get the correct segmentation path for each sample in the batch
+                            seg_idx = (step * batch_size + i) % len(seg_paths)
+                            fixed_seg_path = seg_paths[seg_idx]
+
+                            base_dir = os.path.dirname(fixed_seg_path)
+                            base_name = os.path.splitext(os.path.basename(fixed_seg_path))[0]
+                            dist_dir = os.path.join(base_dir, 'distanceMaps')
+                            os.makedirs(dist_dir, exist_ok=True)
+                            dist_path = os.path.join(dist_dir, f"{base_name}_distanceMap.npy")
+
+                            # Compute or load distance map
+                            if os.path.exists(dist_path):
+                                dist_map = np.load(dist_path)
+                            else:
+                                dist_map = compute_signed_distance_map(fixed_seg[i], dist_path)
+                            dist_map_tensor = torch.from_numpy(dist_map).unsqueeze(0).unsqueeze(0).to(device)
+
+                            # Use warped_seg for each batch item if it's batched (likely is: (B, 1, D, H, W))
+                            surface_loss_val += surface_loss(warped_seg[i:i+1], dist_map_tensor)
+
+                        # Average over batch and multiply by lambda
+                        surface_loss_val = (surface_loss_val / batch_size) * args.lambda_surface
+                        loss += surface_loss_val
+
+                        if 'epoch_surface_loss' not in locals():
+                            epoch_surface_loss = []
+                        epoch_surface_loss.append(surface_loss_val.item())
 
             else:
                 # No segmentation weighting → plain MSE or NCC
@@ -659,6 +731,22 @@ def main():
             curr_loss = losses[grad_idx](None, flow_for_grad) * weights[grad_idx]
             loss_list.append(curr_loss.item())
             loss += curr_loss
+            flow_for_jac = y_pred[grad_idx]
+
+            # --- JAC0 Loss (negative Jacobian penalty), batch-compatible ---
+            if args.use_jac0 and step == 0:
+                with torch.no_grad():
+                    # Compute and log negative jacobian fraction for each batch element
+                    frac_negs = []
+                    for i in range(flow_for_jac.shape[0]):  # batch size loop (e.g., 2)
+                        # Convert (3, D, H, W) -> (D, H, W, 3)
+                        flow_np = flow_for_jac[i].permute(1, 2, 3, 0).detach().cpu().numpy()
+                        jac_det = vxm.py.utils.jacobian_determinant(flow_np)  # (D, H, W)
+                        frac_neg = np.mean(jac_det < 0)
+                        frac_negs.append(frac_neg)
+
+
+
 
             # 3) Inverse‐consistency (if requested)
             if args.use_ic and bidir:
@@ -697,6 +785,13 @@ def main():
 
             optimizer.step()
 
+            if args.use_jac0 and step == 0:
+                with torch.no_grad():
+                    # Compute and log negative jacobian fraction for the current batch
+                    jac_det = vxm.py.utils.jacobian_determinant(flow_for_jac)  # You might need your own jacobian fn
+                    frac_neg = (jac_det < 0).float().mean().item()
+                    writer.add_scalar('QA/FractionNegativeJacobian', frac_neg, epoch)
+
             epoch_loss.append(loss_list)
             epoch_total_loss.append(loss.item())
             epoch_step_time.append(time.time() - step_start_time)
@@ -733,11 +828,15 @@ def main():
         writer.add_scalar('DVF/RMS',  flow_rms,  epoch)
         writer.add_scalar('DVF/P95',  flow_p95,  epoch)
         writer.add_scalar('DVF/Max',  flow_max,  epoch)
+        
         avg_losses = np.mean(epoch_loss, axis=0)
         for i, name in enumerate(loss_names[:len(avg_losses)]):
             writer.add_scalar(f'Loss/{name}', avg_losses[i], epoch)
 
-
+        if args.use_seg and 'epoch_dice_loss' in locals():
+            writer.add_scalar('Loss/Dice', np.mean(epoch_dice_loss), epoch)
+        if args.use_surface and 'epoch_surface_loss' in locals():
+            writer.add_scalar('Loss/Surface', np.mean(epoch_surface_loss), epoch)
         if args.use_mi:
             writer.add_scalar('Loss/MutualInformation', np.mean(epoch_mi_loss), epoch)
         if args.use_bending:

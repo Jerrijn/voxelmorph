@@ -1,0 +1,3 @@
+Model,Total DVFs,Passed All QA,Failed JAC0,Failed JAC2,Failed HE,Average Motion Mean (mm),Average Harmonic Energy,Average Jacobian % Negative,QA Pass Rate (%)
+B-Spline,954,0,954,737,0,1.5635691123649023,1.3884325345495863,0.03866660852332285,0.0
+Voxelmorph (base),954,105,849,0,0,0.9729821857296467,0.46012211503493,0.00023836211838312366,11.0062893081761

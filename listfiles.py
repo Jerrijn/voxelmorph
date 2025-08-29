@@ -43,6 +43,6 @@ def list_and_save_nii_gz_paths(root_directory, output_file, indent=0):
 
 # Example usage
 list_and_save_nii_gz_paths(
-    r"C:\Users\P096350\Documents\segmentation_preprocessed",
-    "segmentations_paths.txt"
+    r"C:\Users\P096350\Documents\data_prepped",
+    "data_paths0111.txt"
 )

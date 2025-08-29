@@ -7,99 +7,167 @@ import numpy as np
 import os
 import argparse
 
-def main(csv_path, output_dir):
-    # Load CSV
-    df = pd.read_csv(csv_path)
-    df["Patient"] = df["Patient"].str.upper()
+# Define a color palette
+colors = {
+    "JAC0": "#1f77b4",  # blue
+    "JAC2": "#ff7f0e",  # orange
+    "HE": "#2ca02c",    # green
+    "pass_rate": ["#9467bd"],  # purple as list for seaborn compatibility
+    "motion_10": "blue",
+    "motion_50": "orange",
+    "motion_90": "black"
+}
 
+def load_and_tag(csv_path, model_name):
+    df = pd.read_csv(csv_path)
+    df["Model"] = model_name
+    df["Patient"] = df["Patient"].str.upper()
+    df["Patient_Model"] = df["Patient"] + f" ({model_name})"
+    return df
+
+def plot_qa_rejections_bar(df, output_dir):
+    # Prepare data: count rejections per patient per model
+    data = []
+    for model in df['Model'].unique():
+        for patient in df[df['Model'] == model]['Patient'].unique():
+            sub = df[(df['Model'] == model) & (df['Patient'] == patient)]
+            data.append({
+                'Model': model,
+                'Patient': patient,
+                'JAC0%': (~sub['QA_JAC0']).sum(),
+                'JAC2%': (~sub['QA_JAC2']).sum(),
+                'μHE': (~sub['QA_HE']).sum()
+            })
+    bar_df = pd.DataFrame(data)
+
+    # Only keep categories with nonzero total rejections
+    value_cols = ['JAC0%', 'JAC2%', 'μHE']
+    value_cols = [c for c in value_cols if bar_df[c].sum() > 0]
+
+    # Calculate minimum value among all shown data
+    min_val = min([bar_df[c].min() for c in value_cols])
+    rounded_min = int(np.floor(min_val / 100) * 100)
+
+    # Set up bar plot parameters
+    x = np.arange(len(bar_df))
+    width = 0.25 if len(value_cols) == 3 else (0.33 if len(value_cols) == 2 else 0.5)
+
+    # X-tick labels are patient-model pairs
+    xtick_labels = [f"{row['Patient']} ({row['Model']})" for idx, row in bar_df.iterrows()]
+
+    fig, ax = plt.subplots(figsize=(max(10, len(x) * 0.7), 6))
+    for i, cat in enumerate(value_cols):
+        offset = (i - (len(value_cols)-1)/2) * width
+        color_key = cat.replace('%','').replace('μ','HE') if cat != 'μHE' else 'HE'
+        ax.bar(x + offset, bar_df[cat], width, label=cat, color=colors[color_key])
+
+    ax.set_ylabel('Amount of Rejected DVFs')
+    ax.set_title('QA Rejected DVFs per Patient/Model')
+    ax.set_xticks(x)
+    ax.set_xticklabels(xtick_labels, rotation=30, ha='right')
+    ax.set_ylim(bottom=rounded_min)
+    ax.legend()
+    fig.tight_layout()
+    plt.savefig(os.path.join(output_dir, "qa_rejections_per_patient_bar.png"))
+    plt.close()
+
+
+
+
+def main(csv_paths, model_names, output_dir):
     os.makedirs(output_dir, exist_ok=True)
 
-    # === 1. QA Rejection Counts (Fig. 6a style) ===
-    rejections = df.groupby("Patient")[["QA_JAC0", "QA_JAC2", "QA_HE"]].apply(lambda x: (~x).sum())
-    x = np.arange(len(rejections))
-    bar_width = 0.25
+    # === Load and tag all models ===
+    all_dfs = [load_and_tag(p, n) for p, n in zip(csv_paths, model_names)]
+    df = pd.concat(all_dfs, ignore_index=True)
 
-    plt.figure(figsize=(12, 6))
-    plt.bar(x - bar_width, rejections["QA_JAC0"], width=bar_width, label="JAC0%", color="#D4A017")
-    plt.bar(x, rejections["QA_JAC2"], width=bar_width, label="JAC2%", color="#D4A017", hatch='//')
-    plt.bar(x + bar_width, rejections["QA_HE"], width=bar_width, label="μHE", color="#D4A017", hatch='..')
-    plt.xticks(x, rejections.index)
-    plt.ylabel("Amount of Rejected DVFs")
-    plt.title("QA Rejected DVFs per Patient")
+    # === QA Summary Table (per model) ===
+    summary_rows = []
+    for model in df['Model'].unique():
+        df_model = df[df['Model'] == model]
+        summary = {
+            "Model": model,
+            "Total DVFs": len(df_model),
+            "Passed All QA": df_model["QA_Passed"].sum(),
+            "Failed JAC0": (~df_model["QA_JAC0"]).sum(),
+            "Failed JAC2": (~df_model["QA_JAC2"]).sum(),
+            "Failed HE": (~df_model["QA_HE"]).sum(),
+            "Average Motion Mean (mm)": pd.to_numeric(df_model["Motion Mean"], errors='coerce').mean(),
+            "Average Harmonic Energy": pd.to_numeric(df_model["Harmonic Energy"], errors='coerce').mean(),
+            "Average Jacobian % Negative": pd.to_numeric(df_model["Jacobian % Negative"], errors='coerce').mean(),
+            "QA Pass Rate (%)": 100 * df_model["QA_Passed"].sum() / len(df_model)
+        }
+        summary_rows.append(summary)
+    overview_df = pd.DataFrame(summary_rows)
+    overview_df.to_csv(os.path.join(output_dir, "qa_summary_table.csv"), index=False)
+
+    # === Visual QA Summary Table for Presentation ===
+    fig, ax = plt.subplots(figsize=(12, 1 + len(overview_df)*0.6))
+    ax.axis('tight')
+    ax.axis('off')
+    table = ax.table(cellText=np.round(overview_df.select_dtypes(include=[np.number]).values, 3),
+                     colLabels=overview_df.columns,
+                     cellLoc='center',
+                     loc='center')
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1.2, 1.2)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "qa_summary_visual_table.png"))
+    plt.close()
+
+    # === QA Pass Rate Bar Chart ===
+    plt.figure(figsize=(6, 4))
+    sns.barplot(x="Model", y="QA Pass Rate (%)", data=overview_df, color=colors["pass_rate"][0])
+    plt.title("QA Pass Rate per Model")
+    plt.ylabel("QA Pass Rate (%)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "qa_pass_rate.png"))
+    plt.close()
+
+    # === Harmonic Energy vs Motion Correlation Plot (consistent color per Patient_Model) ===
+    plt.figure(figsize=(8, 6))
+    unique_ids = df['Patient_Model'].unique()
+    color_map = dict(zip(unique_ids, sns.color_palette("husl", len(unique_ids))))
+    for pid in unique_ids:
+        sub = df[df['Patient_Model'] == pid]
+        plt.scatter(pd.to_numeric(sub["Harmonic Energy"], errors='coerce'),
+                    pd.to_numeric(sub["Motion Mean"], errors='coerce'),
+                    label=pid, color=color_map[pid], s=20)
+    plt.xlabel("Harmonic Energy")
+    plt.ylabel("Motion Mean")
+    plt.title("Correlation: Harmonic Energy vs Mean Motion")
     plt.legend()
-    plt.grid(True, axis='y')
     plt.tight_layout()
-    plt.savefig(f"{output_dir}/qa_rejections_bar.png")
+    plt.savefig(os.path.join(output_dir, "motion_vs_he.png"))
     plt.close()
 
-    # === 2. MVH Before/After QA (Fig. 6b style) ===
-    mvh = df.groupby("Patient").agg(
-        M10_all=("Motion P10", "mean"),
-        M50_all=("Motion P50", "mean"),
-        M90_all=("Motion P90", "mean")
-    )
-    mvh_filt = df[df["QA_Passed"]].groupby("Patient").agg(
-        M10_filt=("Motion P10", "mean"),
-        M50_filt=("Motion P50", "mean"),
-        M90_filt=("Motion P90", "mean")
-    )
-
-    plt.figure(figsize=(12, 6))
-    for i, pid in enumerate(mvh.index):
-        if pid in mvh_filt.index:
-            plt.plot(i, mvh.loc[pid, "M10_all"], 'o', color='blue')
-            plt.plot(i, mvh_filt.loc[pid, "M10_filt"], 'o', markerfacecolor='white', markeredgecolor='blue')
-            plt.plot(i, mvh.loc[pid, "M50_all"], 's', color='orange')
-            plt.plot(i, mvh_filt.loc[pid, "M50_filt"], 's', markerfacecolor='white', markeredgecolor='orange')
-            plt.plot(i, mvh.loc[pid, "M90_all"], '^', color='black')
-            plt.plot(i, mvh_filt.loc[pid, "M90_filt"], '^', markerfacecolor='white', markeredgecolor='black')
-
-    plt.xticks(np.arange(len(mvh)), mvh.index)
-    plt.ylabel("Motion (mm)")
-    plt.title("MVH Parameters Before/After QA Filtering")
-    plt.grid(True, axis='y')
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/mvh_comparison.png")
-    plt.close()
-
-    # === 3. Harmonic Energy Distribution ===
-    plt.figure(figsize=(12, 6))
-    df["Log HE"] = np.log1p(df["Harmonic Energy"])
-    sns.boxplot(x="Patient", y="Log HE", data=df)
+    # === Harmonic Energy Distribution Box Plot (same color scheme as above) ===
+    plt.figure(figsize=(8, 6))
+    sns.boxplot(x="Patient_Model",
+                y=np.log1p(pd.to_numeric(df["Harmonic Energy"], errors='coerce')),
+                data=df,
+                palette=color_map)
+    plt.xticks(rotation=45, ha="right")
     plt.title("Harmonic Energy Distribution (log-scaled)")
     plt.ylabel("log(1 + Harmonic Energy)")
-    plt.grid(True, axis='y')
     plt.tight_layout()
-    plt.savefig(f"{output_dir}/harmonic_energy_distribution.png")
+    plt.savefig(os.path.join(output_dir, "harmonic_energy_distribution.png"))
     plt.close()
 
-    # === 4. QA Pass Rate per Patient ===
-    qa_pass_rate = df.groupby("Patient")["QA_Passed"].mean() * 100
-    qa_pass_rate = qa_pass_rate.sort_values()
+    # === QA Rejections Grouped Bar Plot ===
+    plot_qa_rejections_bar(df, output_dir)
 
-    plt.figure(figsize=(10, 6))
-    qa_pass_rate.plot(kind="barh", color="seagreen")
-    plt.xlabel("QA Pass Rate (%)")
-    plt.title("Proportion of DVFs Passing QA")
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/qa_pass_rate.png")
-    plt.close()
-
-    # === 5. Motion vs Harmonic Energy Correlation ===
-    plt.figure(figsize=(8, 6))
-    sns.scatterplot(x="Harmonic Energy", y="Motion Mean", hue="Patient", data=df)
-    plt.title("Correlation: Harmonic Energy vs Mean Motion")
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f"{output_dir}/motion_vs_he.png")
-    plt.close()
-
-    print(f"[DONE] All plots saved in: {output_dir}")
+    print(f"[DONE] All plots and QA summary saved to {output_dir}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--csv_path", required=True, help="Path to the dvf_statistics.csv file")
-    parser.add_argument("--output_folder", required=True, help="Output folder for the saved plots")
+    parser.add_argument("--csv_paths", nargs='+', required=True, help="List of CSV paths for each model")
+    parser.add_argument("--model_names", nargs='+', required=True, help="List of model names in the same order as CSVs")
+    parser.add_argument("--output_folder", required=True, help="Directory to save all generated plots")
     args = parser.parse_args()
 
-    main(args.csv_path, args.output_folder)
+    if len(args.csv_paths) != len(args.model_names):
+        raise ValueError("Number of --csv_paths must match number of --model_names")
+
+    main(args.csv_paths, args.model_names, args.output_folder)

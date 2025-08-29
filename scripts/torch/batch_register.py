@@ -4,6 +4,7 @@ import os
 import argparse
 import numpy as np
 import torch
+import time
 import voxelmorph as vxm
 from voxelmorph.torch.networks import VxmDense
 
@@ -34,6 +35,7 @@ def process_directory(input_dir, output_dir, model, device, stride, multichannel
     if n < stride + 1:
         return
 
+    count = 0
     for i in range(0, n - stride):
         mov_fname = nii_files[i + stride]
         fix_fname = nii_files[i]
@@ -41,6 +43,7 @@ def process_directory(input_dir, output_dir, model, device, stride, multichannel
         fix_path = os.path.join(input_dir, fix_fname)
 
         print(f"Registering: {mov_path} → {fix_path}")
+        t_start = time.time()
 
         add_feat_axis = not multichannel
 
@@ -50,11 +53,18 @@ def process_directory(input_dir, output_dir, model, device, stride, multichannel
         fixed, fixed_affine = vxm.py.utils.load_volfile(
             fix_path, add_batch_axis=True, add_feat_axis=add_feat_axis, ret_affine=True
         )
-
+        if moving.shape != fixed.shape:
+            print(f"Skipping due to shape mismatch: {mov_path} ({moving.shape}) vs {fix_path} ({fixed.shape})")
+            continue
         input_moving = torch.from_numpy(moving).to(device).float().permute(0, 4, 1, 2, 3)
         input_fixed  = torch.from_numpy(fixed).to(device).float().permute(0, 4, 1, 2, 3)
 
         moved, warp = model(input_moving, input_fixed, registration=True)
+
+        t_end = time.time()
+        count += 1
+        if count <= 5:
+            print(f"⏱ Registration {count}: {t_end - t_start:.3f} seconds.")
 
         idx_m = extract_index(mov_fname)
         idx_f = extract_index(fix_fname)

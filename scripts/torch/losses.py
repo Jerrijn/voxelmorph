@@ -78,7 +78,8 @@ class MSE:
              y_pred: torch.Tensor,
              weight_mask: torch.Tensor = None) -> torch.Tensor:
         # y_true, y_pred: (B, C, D, H, W)
-        if weight_mask is None:
+        #if weight_mask is None:
+        if True:
             return torch.mean((y_true - y_pred) ** 2)
 
         # Weighted MSE numerator: sum_x [ w(x) * (error)^2 ]
@@ -104,7 +105,7 @@ class Dice:
         top = 2 * (y_true * y_pred).sum(dim=vol_axes)
         bottom = torch.clamp((y_true + y_pred).sum(dim=vol_axes), min=1e-5)
         dice = torch.mean(top / bottom)
-        return -dice
+        return 1-dice
 
 
 class Grad:

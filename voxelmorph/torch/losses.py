@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import math
+from scipy.ndimage import distance_transform_edt
 
 
 class NCC:
@@ -78,7 +79,7 @@ class MSE:
              y_pred: torch.Tensor,
              weight_mask: torch.Tensor = None) -> torch.Tensor:
         # y_true, y_pred: (B, C, D, H, W)
-        if weight_mask is None:
+        if True:
             return torch.mean((y_true - y_pred) ** 2)
 
         # Weighted MSE numerator: sum_x [ w(x) * (error)^2 ]
@@ -108,7 +109,7 @@ class Dice:
         top = 2 * (y_true * y_pred).sum(dim=vol_axes)
         bottom = torch.clamp((y_true + y_pred).sum(dim=vol_axes), min=1e-5)
         dice = torch.mean(top / bottom)
-        return -dice
+        return 1-dice
 
 
 class Grad:
@@ -332,3 +333,98 @@ class BendingEnergyLoss(nn.Module):
         The first argument is ignored (typically y_true) since bending energy only depends on the predicted field.
         """
         return self.forward(y_pred)
+    
+class jac0_loss(nn.Module):
+    """
+    Penalizes negative Jacobian determinants ("JAC0 loss") for 3D flows.
+    Loss = mean((jac_det[jac_det < 0]) ** 2)
+    """
+
+    def __init__(self, reduction='mean'):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, flow):
+        # flow: (B, 3, D, H, W)
+        B, C, D, H, W = flow.shape
+        # Compute finite differences
+        dx = flow[:, 0, 1:, :-1, :-1] - flow[:, 0, :-1, :-1, :-1]
+        dy = flow[:, 1, :-1, 1:, :-1] - flow[:, 1, :-1, :-1, :-1]
+        dz = flow[:, 2, :-1, :-1, 1:] - flow[:, 2, :-1, :-1, :-1]
+
+        # Partial derivatives for Jacobian matrix
+        dFy_dx = dx
+        dFy_dy = dy
+        dFy_dz = dz
+
+        # Cross-partials
+        dFx_dy = flow[:, 0, :-1, 1:, :-1] - flow[:, 0, :-1, :-1, :-1]
+        dFx_dz = flow[:, 0, :-1, :-1, 1:] - flow[:, 0, :-1, :-1, :-1]
+        dFz_dx = flow[:, 2, 1:, :-1, :-1] - flow[:, 2, :-1, :-1, :-1]
+        dFz_dy = flow[:, 2, :-1, 1:, :-1] - flow[:, 2, :-1, :-1, :-1]
+        dFy_dx = flow[:, 1, 1:, :-1, :-1] - flow[:, 1, :-1, :-1, :-1]
+        dFx_dx = dx
+        dFz_dz = dz
+
+        # Build full Jacobian: (B, D-1, H-1, W-1, 3, 3)
+        J = torch.zeros((B, D-1, H-1, W-1, 3, 3), device=flow.device)
+        # diagonal
+        J[..., 0, 0] = 1 + dFx_dx
+        J[..., 1, 1] = 1 + dFy_dy
+        J[..., 2, 2] = 1 + dFz_dz
+        # off-diagonal
+        J[..., 0, 1] = dFx_dy
+        J[..., 0, 2] = dFx_dz
+        J[..., 1, 0] = dFy_dx
+        J[..., 1, 2] = dFy_dz
+        J[..., 2, 0] = dFz_dx
+        J[..., 2, 1] = dFz_dy
+
+        # determinant
+        jac_det = torch.linalg.det(J)
+
+        # penalize negative values
+        neg_jac = torch.clamp(jac_det, max=0)
+        loss = neg_jac.pow(2)   # L2 penalty
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        else:
+            return loss
+        
+class SurfaceLoss(nn.Module):
+    """
+    Implementation of Surface Loss as described in:
+    Kervadec et al., "Boundary loss for highly unbalanced segmentation," MICCAI 2019.
+
+    This loss uses the distance map of the ground truth segmentation to penalize errors near the boundary.
+    The ground truth must be binary. The distance map should have values:
+      - Negative inside the object
+      - Positive outside the object
+    """
+    def __init__(self):
+        super(SurfaceLoss, self).__init__()
+
+    def forward(self, prediction, distance_map):
+        """
+        prediction: (B, 1, D, H, W) - model output after sigmoid or softmax (probabilities)
+        distance_map: (B, 1, D, H, W) - distance transform of GT segmentation
+        """
+        assert prediction.shape == distance_map.shape, f"Prediction shape {prediction.shape} and distance map shape {distance_map.shape} must match"
+        return (prediction * distance_map).mean()
+
+def compute_signed_distance_map(seg_tensor, save_path):
+    """
+    seg_tensor: torch.Tensor of shape (1, D, H, W) - binary segmentation mask
+    save_path: file path to save the computed distance map (.npy)
+    """
+    seg_np = seg_tensor.squeeze(0).cpu().numpy()
+    posmask = seg_np.astype(bool)
+    negmask = ~posmask
+    pos_dist = distance_transform_edt(posmask)
+    neg_dist = distance_transform_edt(negmask)
+    dist_map = (neg_dist - pos_dist).astype(np.float32)
+    np.save(save_path, dist_map)
+    print(f"Distance map saved to {save_path}")
+    return dist_map
