@@ -1,0 +1,13 @@
+Model_Patient,JAC0%,JAC2%,μHE,Total DVFs
+NCC (1 timestep) - pt001,0,0,0,636
+NCC (1 timestep) - pt002,0,0,0,477
+NCC (1 timestep) - pt011,0,0,0,318
+NCC (1 timestep) - pt022,0,0,0,477
+NCC (150 timesteps) - pt002,0,0,0,30
+NCC (150 timesteps) - pt022,0,1,0,30
+NCC + Dice (1 timestep - pt001,0,0,0,636
+NCC + Dice (1 timestep - pt002,0,0,0,477
+NCC + Dice (1 timestep - pt011,0,0,0,318
+NCC + Dice (1 timestep - pt022,0,0,0,477
+NCC + Dice (150 timesteps) - pt002,0,0,0,30
+NCC + Dice (150 timesteps) - pt022,0,2,0,30

@@ -1,0 +1,25 @@
+Model_Patient,JAC0%,JAC2%,μHE,Total DVFs
+B-Spline - pt001,70,80,0,636
+B-Spline - pt002,55,9,4,477
+B-Spline - pt011,43,15,0,318
+B-Spline - pt022,345,249,30,477
+MSE - pt001,0,30,2,636
+MSE - pt002,0,6,0,477
+MSE - pt011,0,19,0,318
+MSE - pt022,0,40,0,477
+MSE + DICE - pt001,0,32,2,636
+MSE + DICE - pt002,0,6,0,477
+MSE + DICE - pt011,0,20,0,318
+MSE + DICE - pt022,0,41,0,477
+NCC - pt001,0,0,0,636
+NCC - pt002,0,0,0,477
+NCC - pt011,0,0,0,318
+NCC - pt022,0,0,0,477
+150 - pt002,0,0,0,30
+150 - pt022,0,1,0,30
+NCC + DICE - pt001,0,0,0,636
+NCC + DICE - pt002,0,0,0,477
+NCC + DICE - pt011,0,0,0,318
+NCC + DICE - pt022,0,0,0,477
+seg150 - pt002,0,0,0,30
+seg150 - pt022,0,2,0,30

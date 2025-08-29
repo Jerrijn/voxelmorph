@@ -1,0 +1,17 @@
+Model,Patient,Rejected DVFs,Passed DVFs,Total DVFs
+B-Spline (new),pt001,83,553,636
+B-Spline (new),pt002,55,422,477
+B-Spline (fix),pt011,44,274,318
+B-Spline (fix),pt022,346,131,477
+MSE + seg (mseseg),pt001,32,604,636
+MSE + seg (mseseg),pt002,6,471,477
+MSE + seg (fix),pt011,20,298,318
+MSE + seg (fix),pt022,41,436,477
+NCC (ncc),pt001,0,636,636
+NCC (ncc),pt002,0,477,477
+NCC (fix),pt011,0,318,318
+NCC (fix),pt022,0,477,477
+NCC + seg (nccseg),pt001,0,636,636
+NCC + seg (nccseg),pt002,0,477,477
+NCC + seg (fix),pt011,0,318,318
+NCC + seg (fix),pt022,0,477,477
